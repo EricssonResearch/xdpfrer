@@ -31,6 +31,8 @@ Tested with Debian Bookworm and Ubuntu 23.04, 23.10.
 sudo apt install build-essential gcc-multilib clang llvm linux-tools-common bpftool libbpf-dev
 ```
 
+**Note: libbpf version must be at least 1.3.0 on Ubuntu 23.04.**
+
 ## Building
 
 ```
