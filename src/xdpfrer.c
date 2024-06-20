@@ -77,33 +77,35 @@ struct frer_config_item {
 ////////////////Config part///////////////
 // Everything is hardcoded. Proper control plane would be better.
 
-// Ingress VLAN translation table:
-// Before the FRER functions
-// Ingress iface, VID from, VID to
-static struct vlan_translation_table ivt[] = {
-    {"aeth0", { 10, 55 }},
-    {"beth0", { 10, 66 }},
+// Replication VLAN translation table:
+// Translation is made after replication function
+// Egress iface, VID from, VID to
+static struct vlan_translation_table rvt[] = {
+    {"enp3s0", { 10, 50 }},
+    {"enp6s0", { 10, 55 }},
+    {"enp4s0", { 10, 60 }},
+    {"enp7s0", { 10, 66 }},
 };
 
-// Egress VLAN translation table
-// After the FRER functions
-// Egress iface, VID from, VID to
+// Elimination VLAN translation table
+// Translation is made before elimination function
+// Ingress iface, VID from, VID to
 static struct vlan_translation_table evt[] = {
-    {"enp4s0", { 55, 10 }},
+    {"enp4s0", { 50, 10 }},
     {"enp7s0", { 55, 10 }},
-    {"enp3s0", { 66, 10 }},
+    {"enp3s0", { 60, 10 }},
     {"enp6s0", { 66, 10 }},
 };
 
 // FRER configuration table
 // Interface, matching VID, Generator/Recovery, num of ifaces, iface names
 static struct frer_config_item cfg[] = {
-    { "aeth0", 55, FRER_GEN, 2, { "enp3s0", "enp6s0" }, 0 },
-    { "beth0", 66, FRER_GEN, 2, { "enp4s0", "enp7s0" }, 0 },
-    { "enp3s0", 66, FRER_RCVY, 1, { "aeth0" }, 0 },
-    { "enp6s0", 66, FRER_RCVY, 1, { "aeth0" }, 0 },
-    { "enp4s0", 55, FRER_RCVY, 1, { "beth0" }, 0 },
-    { "enp7s0", 55, FRER_RCVY, 1, { "beth0" }, 0 },
+    { "aeth0", 10, FRER_GEN, 2, { "enp3s0", "enp6s0" }, 0 },
+    { "beth0", 10, FRER_GEN, 2, { "enp4s0", "enp7s0" }, 0 },
+    { "enp3s0", 10, FRER_RCVY, 1, { "aeth0" }, 0 },
+    { "enp6s0", 10, FRER_RCVY, 1, { "aeth0" }, 0 },
+    { "enp4s0", 10, FRER_RCVY, 1, { "beth0" }, 0 },
+    { "enp7s0", 10, FRER_RCVY, 1, { "beth0" }, 0 },
 };
 
 const char route0[] = "enp4s0";
@@ -222,6 +224,10 @@ static int config_frer(struct xdpfrer_bpf *frer)
                         return -EINVAL;
                     }
                     iface.ifindex = ifindex;
+
+                    // Attach XDP prog to change VLAN ID after replication
+                    iface.bpf_prog.fd = bpf_program__fd(frer->progs.replicate_postprocessing);
+
                     ret = bpf_map_update_elem(tx_ifaces_map_fd, &j, &iface, 0);
                     if (ret < 0) {
                         fprintf(stderr, "\tFailed to insert ifindex to replicate map\n");
@@ -280,7 +286,7 @@ static void cleanup_frer(struct xdpfrer_bpf *frer)
 static int setup_vlan_translation(int table_fd, struct vlan_translation_table *t, int entries)
 {
     /* int evt_table_fd = bpf_map__fd(frer->maps.evt); */
-    /* int entries = sizeof(ivt) / sizeof(struct vlan_translation_table); */
+    /* int entries = sizeof(rvt) / sizeof(struct vlan_translation_table); */
     for (int i = 0; i < entries; ++i) {
         struct vlan_translation_entry e;
         e.from = t[i].vte.from;
@@ -332,7 +338,7 @@ int main(void)
     if (ret < 0)
         goto end;
 
-    ret = setup_vlan_translation(bpf_map__fd(skel->maps.ivt), ivt, sizeof(ivt)/sizeof(struct vlan_translation_table));
+    ret = setup_vlan_translation(bpf_map__fd(skel->maps.rvt), rvt, sizeof(rvt)/sizeof(struct vlan_translation_table));
     if (ret < 0)
         goto end;
 
