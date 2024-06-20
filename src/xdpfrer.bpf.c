@@ -84,7 +84,7 @@ struct {
     __uint(max_entries, 4096);
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(struct vlan_translation_entry));
-} ivt SEC(".maps");
+} rvt SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -300,7 +300,7 @@ static inline int rm_rtag(struct xdp_md *pkt, ushort *seq)
     return 0;
 }
 
-static inline int change_vlan(const struct xdp_md *pkt, bool ingress)
+static inline int change_vlan(const struct xdp_md *pkt, int ifindex, bool replication)
 {
     void *data = (void *)(long) pkt->data;
     void *data_end = (void *)(long) pkt->data_end;
@@ -313,11 +313,10 @@ static inline int change_vlan(const struct xdp_md *pkt, bool ingress)
     if (old_vid < 0)
         return -1;
 
-    const int ifindex = pkt->ingress_ifindex;
-    //bpf_printk("Old VID valid: %d RX ifinex: %d", old_vid, ifindex);
+    //bpf_printk("Old VID valid: %d ifinex: %d replication: %d", old_vid, ifindex, replication);
     struct vlan_translation_entry *vte;
-    if (ingress) {
-        vte = bpf_map_lookup_elem(&ivt, &ifindex);
+    if (replication) {
+        vte = bpf_map_lookup_elem(&rvt, &ifindex);
     } else {
         vte = bpf_map_lookup_elem(&evt, &ifindex);
     }
@@ -371,10 +370,6 @@ int replicate(struct xdp_md *pkt)
     if (data + ethhdr_sz + vlanhdr_sz > data_end)
         return XDP_DROP;
 
-    int ret = change_vlan(pkt, true);
-    if (ret < 0)
-        return XDP_DROP;
-
     int vid = get_vlan_id(pkt);
     if (vid < 0)
         return XDP_DROP;
@@ -385,7 +380,7 @@ int replicate(struct xdp_md *pkt)
     //bpf_printk("Generator for %d VID found", vid);
 
     uint16_t seq = genseq(gen);
-    ret = add_rtag(pkt, &seq);
+    int ret = add_rtag(pkt, &seq);
     if (ret < 0)
         return XDP_DROP;
 
@@ -393,12 +388,19 @@ int replicate(struct xdp_md *pkt)
     if (!tx)
         return XDP_DROP;
 
-    ret = change_vlan(pkt, false);
-    if (ret < 0)
-        return XDP_DROP;
     //bpf_printk("Broadcast the packet");
 
     return bpf_redirect_map(tx, 0, BPF_F_BROADCAST | BPF_F_EXCLUDE_INGRESS);
+}
+
+SEC("xdp/devmap")
+int replicate_postprocessing(struct xdp_md *pkt)
+{
+    int ret = change_vlan(pkt, pkt->egress_ifindex, true);
+    if (ret < 0)
+        return XDP_DROP;
+
+    return XDP_PASS;
 }
 
 SEC("xdp")
@@ -410,7 +412,7 @@ int eliminate(struct xdp_md *pkt)
     if (data + ethhdr_sz + vlanhdr_sz + rtaghdr_sz > data_end)
         goto drop;
 
-    int ret = change_vlan(pkt, true);
+    int ret = change_vlan(pkt, pkt->ingress_ifindex, false);
     if (ret < 0)
         goto drop;
 
@@ -430,12 +432,6 @@ int eliminate(struct xdp_md *pkt)
     int *tx_ifindex = bpf_map_lookup_elem(&eliminate_tx_map, &vid);
     if (!tx_ifindex)
         goto drop;
-
-    ret = change_vlan(pkt, false);
-    if (ret < 0) {
-        //bpf_printk("Failed to change egress VLAN!");
-        goto drop;
-    }
 
     bpf_spin_lock(&(rec->lock));
     bool pass = recover(rec, seq); 
