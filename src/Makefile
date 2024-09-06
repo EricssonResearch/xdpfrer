@@ -1,7 +1,7 @@
 CFLAGS=-Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-declarations -Wwrite-strings -Werror
 CC=clang
 
-.PHONY: all
+.PHONY: all install clean
 all: xdpfrer
 
 vmlinux.h:
@@ -21,7 +21,6 @@ xdpfrer: xdpfrer.o
 
 install: xdpfrer
 	cp xdpfrer /usr/local/bin/
-	cp interface_switcher /usr/local/bin
 
 clean:
 	rm *.o *.skel.h vmlinux.h xdpfrer

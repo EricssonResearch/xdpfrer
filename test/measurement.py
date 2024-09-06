@@ -6,6 +6,7 @@ import seaborn as sns
 import pandas as pd
 import concurrent.futures
 import platform
+import numpy as np
 import shlex
 import time
 import glob
@@ -76,7 +77,6 @@ def exec_fg(cmd, silent=True, timeout=None):
 
 R2EXE = "/usr/local/bin/r2dtwo"
 XDPEXE = "/usr/local/bin/xdpfrer"
-INTERFACESWITCHER = "/usr/local/bin/interface_switcher"
 
 NSX= "ip netns exec frerenv"
 TX = "ip netns exec talker"
@@ -103,6 +103,7 @@ PKTS_ADAPT = 10000
 PKTS_1MS = 10000
 ERROR_TEST_TIME = 15
 XDP_ERROR_TEST = True
+DPI = 96
 
 def run_tests():
     exec_fg("killall -SIGTERM r2dtwo")
@@ -110,19 +111,20 @@ def run_tests():
     exec_fg("killall -SIGTERM xdpfrer")
 
     stress = [
-			# ("stress", f"taskset -c {cpu['r2br0']}-{cpu['r2br1']} chrt -r 1 hackbench -T -l 10000000 -s 1000 -g 1 -f 10"),
-			("stress", f"stress-ng --taskset {cpu['r2br0']} --fault 5", f"stress-ng --taskset {cpu['r2br1']} --fault 5"),
-            # ("brutal", f"taskset -c {cpu['ping']} hackbench -T -l 10000000 -s 10000 -g 5 -f 5"),
-            ( "idle", "echo", "echo" ),
+		("stress", f"stress-ng --taskset {cpu['r2br0']} --fault 5", f"stress-ng --taskset {cpu['r2br1']} --fault 5"),
+        ( "idle", "echo", "echo" ),
     ]
 
-    exe = [
-        # ("r2", f"{NSX} taskset -c {cpu['r2br0']} {R2EXE} r2br0.ini",
-        #         f"{NSX} taskset -c {cpu['r2br1']} {R2EXE} r2br1.ini"),
-        # ("r2_rt", f"{NSX} taskset -c {cpu['r2br0']} chrt -r 99 {R2EXE} r2br0.ini",
-        #         f"{NSX} taskset -c {cpu['r2br1']} chrt -r 99 {R2EXE} r2br1.ini"),
-        ("xdp", f"{NSX} {XDPEXE}")
-    ]
+    exe = {
+        # "r2_rt": [f"{NSX} taskset -c {cpu['r2br0']} chrt -r 99 {R2EXE} r2br0.ini",
+        #           f"{NSX} taskset -c {cpu['r2br1']} chrt -r 99 {R2EXE} r2br1.ini"],
+        # "r2": [f"{NSX} taskset -c {cpu['r2br0']} {R2EXE} r2br0.ini",
+        #        f"{NSX} taskset -c {cpu['r2br1']} {R2EXE} r2br1.ini"],
+        "xdp": [f"{NSX} {XDPEXE} -m repl -i aeth0:10 -e enp3s0:55 -e enp6s0:56",
+                f"{NSX} {XDPEXE} -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20",
+                f"{NSX} {XDPEXE} -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67",
+                f"{NSX} {XDPEXE} -m elim -i enp3s0:66 -i enp6s0:67 -e aeth0:10"]
+    }
 
     ping = [
         ("adaptive_unpin", f"{TX} ping 10.0.0.2 -A -s 1000 -I teth0.10 -c {PKTS_ADAPT} -q"),
@@ -135,15 +137,15 @@ def run_tests():
     ]
 
     for s in stress:
-        for e in exe:
+        for ekey, evalue in exe.items():
             for p in ping:
-                pexe1 = None
+                pexes = []
                 piperf_server = None
                 piperf_client = None
-                test = f"{s[0]}_{e[0]}_{p[0]}"
+                test = f"{s[0]}_{ekey}_{p[0]}"
                 pcap = test + ".pcap"
 
-                if "r2" in e[0] and "iperf" in p[0]:
+                if "r2" in ekey and "iperf" in p[0]:
                     continue
                 print('\n\n-------------------------')
                 print("Test case: ", test)
@@ -152,9 +154,8 @@ def run_tests():
                 ptcpdump = exec_bg(f"{TX} tcpdump -ni teth0.10 icmp -w {pcap} -s 100 -B 10000")
                 pstress1 = exec_bg(s[1])
                 pstress2 = exec_bg(s[2])
-                pexe = exec_bg(e[1])
-                if "r2" in e[0]:
-                    pexe1 = exec_bg(e[2])
+                for instance in evalue:
+                    pexes.append(exec_bg(instance))
 
                 print("EXECUTE: ", p[1])
                 time.sleep(4)
@@ -167,9 +168,8 @@ def run_tests():
                 pstress1.kill()
                 pstress2.kill()
                 ptcpdump.terminate()
-                pexe.terminate()
-                if pexe1:
-                    pexe1.terminate()
+                for pexe in pexes:
+                    pexe.terminate()
                 if "iperf" in p[0]:
                     piperf_server.terminate()
                     piperf_client.terminate()
@@ -180,38 +180,38 @@ def run_error_tests():
     exec_fg("killall -SIGTERM xdpfrer")
 
     ping = f"{TX} chrt 99 ping 10.0.0.2 -i 0.01 -s 1000 -I teth0.10"
-    xdpfrer = f"{NSX} {XDPEXE}"
-    ifshutdown_xdp = [(f"{IFNAMES[0]}", f"{NSX} {INTERFACESWITCHER} $(pgrep xdpfrer) {IFNAMES[0]}"),
-        (f"{IFNAMES[0]}", f"{NSX} {INTERFACESWITCHER} $(pgrep xdpfrer) {IFNAMES[0]}"),
-        (f"all_route", f"{NSX} {INTERFACESWITCHER} $(pgrep xdpfrer) {IFNAMES[0]}; {NSX} {INTERFACESWITCHER} $(pgrep xdpfrer) {IFNAMES[2]}"),
-        (f"all_route", f"{NSX} {INTERFACESWITCHER} $(pgrep xdpfrer) {IFNAMES[2]};"),
-        (f"all_route", f"{NSX} {INTERFACESWITCHER} $(pgrep xdpfrer) {IFNAMES[0]};")]
+    xdpfrer = [f"{NSX} {XDPEXE} -m repl -i aeth0:10 -e enp3s0:55 -e enp6s0:56",
+               f"{NSX} {XDPEXE} -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20",
+               f"{NSX} {XDPEXE} -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67",
+               f"{NSX} {XDPEXE} -m elim -i enp3s0:66 -i enp6s0:67 -e aeth0:10"]
 
-    ifshutdown_r2 = [(f"{IFNAMES[0]}", f"ip link set dev {IFNAMES[0]} down"),
-        (f"{IFNAMES[0]}", f"ip link set dev {IFNAMES[0]} up"),
-        (f"all_route", f"ip link set dev {IFNAMES[0]} down; ip link set dev {IFNAMES[2]} down"),
-        (f"all_route", f"ip link set dev {IFNAMES[2]} up;"),
-        (f"all_route", f"ip link set dev {IFNAMES[0]} up")]
+    ifshutdown = [(f"{IFNAMES[0]}", f"{NSX} ip link set dev {IFNAMES[0]} down"),
+        (f"{IFNAMES[0]}", f"{NSX}ip link set dev {IFNAMES[0]} up"),
+        (f"all_route", f"{NSX} ip link set dev {IFNAMES[0]} down; {NSX} ip link set dev {IFNAMES[2]} down"),
+        (f"all_route", f"{NSX} ip link set dev {IFNAMES[2]} up;"),
+        (f"all_route", f"{NSX} ip link set dev {IFNAMES[0]} up")]
 
     # Change speed on one route.
     if XDP_ERROR_TEST:
         print("Initialize XDPFRER...")
-        pexe = exec_bg(xdpfrer)
+        pexes = []
+        for instance in xdpfrer:
+            pexes.append(exec_bg(instance))
         print(f"Change speed of {IFNAMES[2]} and {IFNAMES[3]} to {SPEED}Mb/s...")
-        exec_fg(f"ethtool -s {IFNAMES[2]} autoneg on speed {SPEED} duplex full", silent=False)
-        exec_fg(f"ethtool -s {IFNAMES[3]} autoneg on speed {SPEED} duplex full", silent=False)
+        exec_fg(f"{NSX} ethtool -s {IFNAMES[2]} autoneg on speed {SPEED} duplex full", silent=False)
+        exec_fg(f"{NSX} ethtool -s {IFNAMES[3]} autoneg on speed {SPEED} duplex full", silent=False)
     else:
         print("Initialize R2DTWO...")
         print(f"Create delay on {IFNAMES[2]} and {IFNAMES[3]}...")
         r2exe1 = exec_bg(f"{R2EXE} r2br0.ini")
         r2exe2 = exec_bg(f"{R2EXE} r2br1.ini")
-        exec_fg(f"tc qdisc add dev {IFNAMES[2]} root netem delay 5ms", silent=False)
-        exec_fg(f"tc qdisc add dev {IFNAMES[3]} root netem delay 5ms", silent=False)
+        exec_fg(f"{NSX} tc qdisc add dev {IFNAMES[2]} root netem delay 5ms", silent=False)
+        exec_fg(f"{NSX} tc qdisc add dev {IFNAMES[3]} root netem delay 5ms", silent=False)
 
     time.sleep(5)
 
     # First test.
-    test = f"error_{'xdp' if XDP_ERROR_TEST else 'r2'}_{ifshutdown_xdp[0][0]}"
+    test = f"error_{'xdp' if XDP_ERROR_TEST else 'r2'}_{ifshutdown[0][0]}"
     pcap = test + ".pcap"
     print('\n\n-------------------------')
     print("Test case: ", test)
@@ -220,16 +220,16 @@ def run_error_tests():
     time.sleep(3) # wait for the reset of the history window which is 2 seconds
     pping = exec_bg(ping, out=OUT_STDOUT)
     time.sleep(ERROR_TEST_TIME / 3.0)
-    os.system(ifshutdown_xdp[0][1]) if XDP_ERROR_TEST else os.system(ifshutdown_r2[0][1])
+    os.system(ifshutdown[0][1])
     time.sleep(ERROR_TEST_TIME / 3.0)
-    os.system(ifshutdown_xdp[1][1]) if XDP_ERROR_TEST else os.system(ifshutdown_r2[1][1])
+    os.system(ifshutdown[1][1])
     time.sleep(ERROR_TEST_TIME / 3.0)
     ptcpdump.terminate()
     pping.send_signal(2)
     time.sleep(1)
 
     # Second Test.
-    test = f"error_{'xdp' if XDP_ERROR_TEST else 'r2'}_{ifshutdown_xdp[2][0]}"
+    test = f"error_{'xdp' if XDP_ERROR_TEST else 'r2'}_{ifshutdown[2][0]}"
     pcap = test + ".pcap"
     print('\n\n-------------------------')
     print("Test case: ", test)
@@ -238,11 +238,11 @@ def run_error_tests():
     time.sleep(3) # wait for the reset of the history window which is 2 seconds
     pping = exec_bg(ping, out=OUT_STDOUT)
     time.sleep(ERROR_TEST_TIME / 4.0)
-    os.system(ifshutdown_xdp[2][1]) if XDP_ERROR_TEST else os.system(ifshutdown_r2[2][1])
+    os.system(ifshutdown[2][1])
     time.sleep(ERROR_TEST_TIME / 4.0)
-    os.system(ifshutdown_xdp[3][1]) if XDP_ERROR_TEST else os.system(ifshutdown_r2[3][1])
+    os.system(ifshutdown[3][1])
     time.sleep(ERROR_TEST_TIME / 4.0)
-    os.system(ifshutdown_xdp[4][1]) if XDP_ERROR_TEST else os.system(ifshutdown_r2[4][1])
+    os.system(ifshutdown[4][1])
     time.sleep(ERROR_TEST_TIME / 4.0)
     ptcpdump.terminate()
     pping.send_signal(2)
@@ -250,14 +250,15 @@ def run_error_tests():
 
     # Reset speed on all routes.
     if XDP_ERROR_TEST:
-        pexe.terminate()
-        exec_fg(f"ethtool -s {IFNAMES[2]} autoneg on speed 2500 duplex full", silent=False)
-        exec_fg(f"ethtool -s {IFNAMES[3]} autoneg on speed 2500 duplex full", silent=False)
+        for exe in pexes:
+            exe.terminate()
+        exec_fg(f"{NSX} ethtool -s {IFNAMES[2]} autoneg on speed 2500 duplex full", silent=False)
+        exec_fg(f"{NSX} ethtool -s {IFNAMES[3]} autoneg on speed 2500 duplex full", silent=False)
     else:
         r2exe1.terminate()
         r2exe2.terminate()
-        exec_fg(f"tc qdisc del dev {IFNAMES[2]} root netem delay 5ms", silent=False)
-        exec_fg(f"tc qdisc del dev {IFNAMES[3]} root netem delay 5ms", silent=False)
+        exec_fg(f"{NSX} tc qdisc del dev {IFNAMES[2]} root netem delay 5ms", silent=False)
+        exec_fg(f"{NSX} tc qdisc del dev {IFNAMES[3]} root netem delay 5ms", silent=False)
 
 def test_data_worker(fn):
     print(fn)
@@ -310,17 +311,17 @@ def formatter_maj_xdp(val, tick):
     return str(f"{val:.2f}")
 
 def gen_plots():
-    os.system("clear")
-    DPI = 96
-
-    print("Initialize plots...")
     sns.set_theme(style="whitegrid", palette="pastel")
     sns.set_context("notebook")
-    df = pd.concat(map(pd.read_csv, glob.glob('*_pin.pcap.txt')), axis=1)
+    all_files = glob.glob('*_pin.pcap.txt')
+    if all_files == []:
+        print("There are no files to generate plots!")
+        return
+    df = pd.concat(map(pd.read_csv, all_files), axis=1)
     df.drop(list(range(0, 10)), inplace=True)
     df.sort_index(axis=1, inplace=True, ascending=True)
 
-    print("Start to create boxplot...")
+    print("Start to create boxplot... ", end="")
     plt.figure(figsize=(2000/DPI, 800/DPI), dpi=DPI)
     sns.boxplot(data=df, orient="h", fliersize=2)
     plt.subplots_adjust(left=0.2, bottom=0.1)
@@ -329,137 +330,139 @@ def gen_plots():
     plt.gcf().gca().xaxis.set_major_formatter(plt.FuncFormatter(lambda x, pos: '{:,.3f}'.format(x) + ' ms'))
     plt.tight_layout()
     plt.savefig("all.pdf", format="pdf")
+    print("[✓]")
 
-    print("Start to create r2rt plot...")
-    plt.figure(figsize=(1.2*600/DPI, 1.2*400/DPI), dpi=DPI)
-    sns.ecdfplot(data=df.filter(axis=1, items=['idle_r2_1ms_pin', 'stress_r2_rt_1ms_pin','stress_r2_1ms_pin']), complementary=True, log_scale=True)
-    plt.gcf().gca().xaxis.set_major_formatter(plt.FuncFormatter(formatter_maj))
-    plt.gcf().gca().xaxis.set_minor_formatter(plt.FuncFormatter(formatter_min))
-    plt.gcf().gca().xaxis.set_tick_params(which='minor', width=1.0, length=5, labelsize=8, labelcolor='0.25')
-    ###plt.xticks(rotation = 45, minor=True)
-    plt.setp(plt.gcf().gca().xaxis.get_minorticklabels(), rotation=45)
-    # plt.gcf().gca().ticklabel_format(useMathText = False)
-    plt.gcf().gca().xaxis.grid(True, which='minor')
-    plt.legend(labels = ['uFRER (default prio) and extra CPU load', 'uFRER (realtime prio) and extra CPU load', 'uFRER only (no extra load)'])
-    plt.xlabel("RTT (millisec)")
-    plt.tight_layout()
-    plt.savefig("r2rt.pdf", format="pdf")
-
-
-    print("Start to create idlexdp plots...")
-    f, (ax1, ax2) = plt.subplots(2, 1, figsize=(500/DPI, 800/DPI), dpi=DPI, sharex=True)
-    ax1.xaxis.grid(True, which='minor')
-    ax2.xaxis.grid(True, which='minor')
-    ax1.xaxis.set_major_formatter(plt.FuncFormatter(lambda x: str(x)))
-    sns.ecdfplot(data=df.filter(axis=1, items=['idle_r2_rt_1ms_pin','idle_xdp_1ms_pin']), complementary=True, ax=ax1, log_scale=True).set_title("No extra CPU load")
-    ax1.legend(labels = ['XDP FRER', 'uFRER'])
-    plt.xlabel("RTT (millisec)")
-    plt.tight_layout()
-    sns.ecdfplot(data=df.filter(axis=1, items=['stress_r2_rt_1ms_pin','stress_xdp_1ms_pin']), complementary=True, ax=ax2, log_scale=True).set_title("Loaded CPU (stress-ng)")
-    plt.gcf().gca().xaxis.set_major_formatter(plt.FuncFormatter(formatter_maj_xdp))
-    plt.gcf().gca().xaxis.set_minor_formatter(plt.FuncFormatter(formatter_min_xdp))
-    plt.gcf().gca().xaxis.set_tick_params(which='minor', width=1.0, length=5, labelsize=8, labelcolor='0.25')
-    ###plt.xticks(rotation = 45, minor=True)
-    plt.setp(plt.gcf().gca().xaxis.get_minorticklabels(), rotation=45)
-    ax2.legend(labels = ['XDP FRER', 'uFRER'])
-    plt.savefig("idlexdp.pdf", format="pdf")
+    print("Start to create r2rt plot... ", end="")
+    neccessary_files = ['idle_r2_1ms_pin.pcap.txt', 'stress_r2_rt_1ms_pin.pcap.txt','stress_r2_1ms_pin.pcap.txt']
+    if not all([os.path.isfile(file) for file in neccessary_files]):
+        print("[x]")
+    else:
+        plt.figure(figsize=(1.2*600/DPI, 1.2*400/DPI), dpi=DPI)
+        sns.ecdfplot(data=df.filter(axis=1, items=[file.rstrip(".pcap.txt") for file in neccessary_files]), complementary=True, log_scale=True)
+        plt.gcf().gca().xaxis.set_major_formatter(plt.FuncFormatter(formatter_maj))
+        plt.gcf().gca().xaxis.set_minor_formatter(plt.FuncFormatter(formatter_min))
+        plt.gcf().gca().xaxis.set_tick_params(which='minor', width=1.0, length=5, labelsize=8, labelcolor='0.25')
+        ###plt.xticks(rotation = 45, minor=True)
+        plt.setp(plt.gcf().gca().xaxis.get_minorticklabels(), rotation=45)
+        # plt.gcf().gca().ticklabel_format(useMathText = False)
+        plt.gcf().gca().xaxis.grid(True, which='minor')
+        plt.legend(labels = ['uFRER (default prio) and extra CPU load', 'uFRER (realtime prio) and extra CPU load', 'uFRER only (no extra load)'])
+        plt.xlabel("RTT (millisec)")
+        plt.tight_layout()
+        plt.savefig("r2rt.pdf", format="pdf")
+        print("[✓]")
 
 
-    print("Start to create loadedxdp plot...")
-    plt.figure(figsize=(600/DPI, 400/DPI), dpi=DPI)
-    sns.ecdfplot(data=df.filter(axis=1, items=["idle_xdp_1ms_pin", "idle_xdp_1ms_iperf_pin"]), complementary=True, log_scale=True)
-    plt.gcf().gca().xaxis.set_major_formatter(plt.FuncFormatter(formatter_maj_xdp))
-    plt.gcf().gca().xaxis.set_minor_formatter(plt.FuncFormatter(formatter_min_xdp))
-    plt.gcf().gca().xaxis.set_tick_params(which='minor', width=1.0, length=5, labelsize=8, labelcolor='0.25')
-    ###plt.xticks(rotation = 45, minor=True)
-    plt.setp(plt.gcf().gca().xaxis.get_minorticklabels(), rotation=45)
-    plt.gcf().gca().xaxis.grid(True, which='minor')
-    plt.legend(labels = ['With UDP background traffic', 'Without background traffic'])
-    plt.xlabel("RTT (millisec)")
-    plt.tight_layout()
-    plt.savefig("loadedxdp.pdf", format="pdf")
+    print("Start to create idlexdp plots... ", end="")
+    neccessary_files = ['idle_r2_rt_1ms_pin.pcap.txt','idle_xdp_1ms_pin.pcap.txt', 'stress_r2_rt_1ms_pin.pcap.txt','stress_xdp_1ms_pin.pcap.txt']
+    if not all([os.path.isfile(file) for file in neccessary_files]):
+        print("[x]")
+    else:
+        f, (ax1, ax2) = plt.subplots(2, 1, figsize=(500/DPI, 800/DPI), dpi=DPI, sharex=True)
+        ax1.xaxis.grid(True, which='minor')
+        ax2.xaxis.grid(True, which='minor')
+        ax1.xaxis.set_major_formatter(plt.FuncFormatter(lambda x: str(x)))
+        sns.ecdfplot(data=df.filter(axis=1, items=[file.rstrip(".pcap.txt") for file in neccessary_files[:2]]), complementary=True, ax=ax1, log_scale=True).set_title("No extra CPU load")
+        ax1.legend(labels = ['XDP FRER', 'uFRER'])
+        plt.xlabel("RTT (millisec)")
+        plt.tight_layout()
+        sns.ecdfplot(data=df.filter(axis=1, items=[file.rstrip(".pcap.txt") for file in neccessary_files[2:]]), complementary=True, ax=ax2, log_scale=True).set_title("Loaded CPU (stress-ng)")
+        plt.gcf().gca().xaxis.set_major_formatter(plt.FuncFormatter(formatter_maj_xdp))
+        plt.gcf().gca().xaxis.set_minor_formatter(plt.FuncFormatter(formatter_min_xdp))
+        plt.gcf().gca().xaxis.set_tick_params(which='minor', width=1.0, length=5, labelsize=8, labelcolor='0.25')
+        ###plt.xticks(rotation = 45, minor=True)
+        plt.setp(plt.gcf().gca().xaxis.get_minorticklabels(), rotation=45)
+        ax2.legend(labels = ['XDP FRER', 'uFRER'])
+        plt.savefig("idlexdp.pdf", format="pdf")
+        print("[✓]")
 
-    print("Start to create error simulation plots...")
-    files = []
-    files.append((f"(a) Faster path down", f"error_{'xdp' if XDP_ERROR_TEST else 'r2'}_{IFNAMES[0]}.pcap.txt"))
-    files.append((f"(b) Both paths down", f"error_{'xdp' if XDP_ERROR_TEST else 'r2'}_all_route.pcap.txt"))
 
-    fig, axs = plt.subplots(len(files), figsize=(1.5*600/DPI, 1.5*400/DPI), dpi=DPI)
-    plt.tight_layout()
-    plt.subplots_adjust(hspace=0.1, left=0.13, top=0.95, bottom=0.1)
-    plt.rcParams['axes.grid'] = True
+    print("Start to create loadedxdp plot... ", end="")
+    neccessary_files = ["idle_xdp_1ms_pin.pcap.txt", "idle_xdp_1ms_iperf_pin.pcap.txt"]
+    if not all([os.path.isfile(file) for file in neccessary_files]):
+        print("[x]")
+    else:
+        plt.figure(figsize=(600/DPI, 400/DPI), dpi=DPI)
+        sns.ecdfplot(data=df.filter(axis=1, items=[file.rstrip(".pcap.txt") for file in neccessary_files]), complementary=True, log_scale=True)
+        plt.gcf().gca().xaxis.set_major_formatter(plt.FuncFormatter(formatter_maj_xdp))
+        plt.gcf().gca().xaxis.set_minor_formatter(plt.FuncFormatter(formatter_min_xdp))
+        plt.gcf().gca().xaxis.set_tick_params(which='minor', width=1.0, length=5, labelsize=8, labelcolor='0.25')
+        ###plt.xticks(rotation = 45, minor=True)
+        plt.setp(plt.gcf().gca().xaxis.get_minorticklabels(), rotation=45)
+        plt.gcf().gca().xaxis.grid(True, which='minor')
+        plt.legend(labels = ['With UDP background traffic', 'Without background traffic'])
+        plt.xlabel("RTT (millisec)")
+        plt.tight_layout()
+        plt.savefig("loadedxdp.pdf", format="pdf")
+        print("[✓]")
 
-    # Try to open the current file. After successful open, read all data from the file.
-    # Store data in an array which contains dictionaries. One dictionary stores a single line.
-    # If a line plot has break(s), it will be more than one dictionary in the data array.
-    for i in range(0, len(files)):
-        res_time_data = []
-        seq_data = []
-        res_time_points = dict()
-        seq_points = dict()
-        first_relative_seconds = 0
-        try:
-            with open(files[i][1], "r") as file:
-                lines = file.readlines()[1:]
-                max_res_time = max([float(item.split('\t')[1]) for item in lines])
-                min_res_time = min([float(item.split('\t')[1]) for item in lines])
-                max_seq = max([int(item.split('\t')[0]) for item in lines])
+def gen_error_plots():
+    exes = ['xdp', 'r2']
+    for e in exes:
+        print(f'Start to create error_{e}.pdf... ', end="")
+        fig, axs = plt.subplots(2, figsize=(1.5*600/DPI, 1.5*400/DPI), dpi=DPI)
+        plt.subplots_adjust(hspace=0.1, left=0.13, top=0.95, bottom=0.1)
+        plt.rcParams['axes.grid'] = True
+        
+        files = [f'error_{e}_{IFNAMES[0]}.pcap.txt', f'error_{e}_all_route.pcap.txt']
+        plot_titles = ['(a) Faster path down', '(b) Both paths down']
+        for i in range(len(files)):
+            try:
+                df = pd.read_csv(f'{files[i]}', delimiter='\t', header=0, usecols=[0, 1, 2, 3], names=['Seq', 'Res_time', 'Time', 'Miliseconds'])
+            except:
+                print("[x]")
+                return
+            
+            if df.size == 0:
+                print("[x]")
+                return
 
-                for j in range(0, (len(lines) - 1)):
-                    seq = int(lines[j].split('\t')[0])
-                    res_time = float(lines[j].split('\t')[1])
-                    time = list(filter(('').__ne__, lines[j].split('\t')[2].split(' ')))[3].split(".")[0]
-                    hours = int(time.split(":")[0])
-                    minutes = int(time.split(":")[1])
-                    seconds = int(time.split(":")[2])
-                    miliseconds = float(lines[j].split('\t')[3].rstrip('\n'))
-                    relative_seconds = hours * 3600 + minutes * 60 + seconds + miliseconds
+            df['Hours'] = df['Time'].apply(lambda time : int(time.replace('  ', ' ').split(' ')[3].split(".")[0].split(":")[0]))
+            df['Minutes'] = df['Time'].apply(lambda time : int(time.replace('  ', ' ').split(' ')[3].split(".")[0].split(":")[1]))
+            df['Seconds'] = df['Time'].apply(lambda time : int(time.replace('  ', ' ').split(' ')[3].split(".")[0].split(":")[2]))
+            df['Nanoseconds'] = df['Time'].apply(lambda time : int(time.replace('  ', ' ').split(' ')[3].split(".")[1]))
+            df['Relative_seconds'] = df['Hours'] * 3600000000000 + df['Minutes'] * 60000000000 + df['Seconds'] * 1000000000 + df['Nanoseconds']
+            df['Relative_seconds'] = df['Relative_seconds'] - df['Relative_seconds'][0]
+            df['Relative_seconds'] = df['Relative_seconds'] / 1000000000
+            df['Seq_points'] = df['Seq'] / (df['Seq'].max() / (df['Res_time'].max() - df['Res_time'].min())) + df['Res_time'].min()
+            
+            # Fill missing data with np.nan
+            for j in range(df['Seq'].min(), df['Seq'].max() - 1):
+                if not (j in df['Seq'].unique()):
+                    row = pd.DataFrame({'Seq': j, 'Res_time': float(np.nan), 'Time': np.nan, 'Miliseconds': np.nan, 'Hours': np.nan, 
+                                    'Minutes': np.nan, 'Seconds': np.nan, 'Relative_seconds': np.nan, 'Seq_points': np.nan}, index=[0])
+                    df = pd.concat([df, row], ignore_index = True)
+                    df.reset_index()
+            df.sort_values(by=['Seq'], inplace=True)
+            
+            # Create plots
+            sns.lineplot(x=df['Relative_seconds'], y=df['Res_time'], linewidth=1, label="RTT", ax=axs[i], legend=False, hue=df['Res_time'].isna().cumsum(),
+                            palette=['b'] * (sum(df['Res_time'].isna()) + 1))
+            sns.lineplot(x=df['Relative_seconds'], y=df['Seq_points'], color="orange", linewidth=1, label="ICMP sequence numbers", ax=axs[i], legend=False)
 
-                    if j == 0:
-                        first_relative_seconds = relative_seconds
-                    relative_seconds -= first_relative_seconds
-
-                    next_seq = int(lines[j+1].split('\t')[0])
-                    if next_seq == (seq + 1):
-                        res_time_points[relative_seconds] = res_time
-                        seq_points[relative_seconds] = seq / (max_seq / (max_res_time - min_res_time)) + min_res_time
-                    else:
-                        res_time_data.append(res_time_points)
-                        seq_data.append(seq_points)
-                        res_time_points = dict()
-                        seq_points = dict()
-                        while next_seq != (seq + 1):
-                            seq += 1
-                file.close()
-
-            res_time_data.append(res_time_points)
-            seq_data.append(seq_points)
-            [sns.lineplot(ax=axs[i], data=d, color="b", linewidth=1, label="RTT") if i == 0 else sns.lineplot(ax=axs[i], data=d, color="b", linewidth=1) for d in res_time_data]
-            [sns.lineplot(ax=axs[i], data=d, color="orange", linewidth=1, label="ICMP sequence numbers") if i == 0 else sns.lineplot(ax=axs[i], data=d, color="orange", linewidth=1) for d in seq_data]
-
+            # Set red lines and labels
             if i == 0:
                 axs[i].legend()
-            axs[i].set_title(files[i][0])
+            axs[i].set_title(plot_titles[i])
             if i == 0:
-                axs[i].axvline(ERROR_TEST_TIME / 3.0, ls='--', color="red")
-                axs[i].axvline(2 * ERROR_TEST_TIME / 3.0, ls='--', color="red")
+                axs[i].axvline(ERROR_TEST_TIME / 3.0, ls='--', color='red')
+                axs[i].axvline(2 * ERROR_TEST_TIME / 3.0, ls='--', color='red')
             else:
-                axs[i].axvline(ERROR_TEST_TIME / 4.0, ls='--', color="red")
-                axs[i].axvline(2 * ERROR_TEST_TIME / 4.0, ls='--', color="red")
-                axs[i].axvline(3 * ERROR_TEST_TIME / 4.0, ls='--', color="red")
+                axs[i].axvline(ERROR_TEST_TIME / 4.0, ls='--', color='red')
+                axs[i].axvline(2 * ERROR_TEST_TIME / 4.0, ls='--', color='red')
+                axs[i].axvline(3 * ERROR_TEST_TIME / 4.0, ls='--', color='red')
             axs[i].yaxis.set_major_formatter(plt.FuncFormatter(lambda y, pos: '{:,.3f}'.format(y) + ' ms'))
 
             if i == len(files) - 1:
-                axs[i].set(xlabel="Time (s)", ylabel="Ping status")
+                axs[i].set(xlabel='Time (s)', ylabel='Ping status')
                 axs[i].xaxis.set_major_formatter(plt.FuncFormatter(lambda x, pos: '{:,.1f}'.format(x)))
             else:
-                axs[i].set(xlabel="", ylabel="Ping status")
+                axs[i].set(xlabel='', ylabel='Ping status')
                 axs[i].xaxis.set_major_formatter(plt.FuncFormatter(lambda x, pos: ''))
-        except Exception as e:
-            print(e)
 
-    # plt.savefig(f"error_{'xdp' if XDP_ERROR_TEST else 'r2'}_sim.pdf", format="pdf")
-    plt.savefig(f"error.pdf", format="pdf")
+        plt.tight_layout()
+        plt.savefig(f'error_{e}.pdf', format='pdf')
+        print("[✓]")
 
 def pin_napi_threads():
     print("Pin napi threads to CPUs...")
@@ -469,13 +472,13 @@ def pin_napi_threads():
         command = str(line).split(' ')[-1]
         if "napi" in command:
             if IFNAMES[0] in command:
-                exec_fg(f"taskset -cp {cpu['napi1']} {pid}", silent=False)
+                exec_fg(f"{NSX} taskset -cp {cpu['napi1']} {pid}", silent=False)
             elif IFNAMES[1] in command:
-                exec_fg(f"taskset -cp {cpu['napi2']} {pid}", silent=False)
+                exec_fg(f"{NSX} taskset -cp {cpu['napi2']} {pid}", silent=False)
             elif IFNAMES[2] in command:
-                exec_fg(f"taskset -cp {cpu['napi3']} {pid}", silent=False)
+                exec_fg(f"{NSX} taskset -cp {cpu['napi3']} {pid}", silent=False)
             elif IFNAMES[3] in command:
-                exec_fg(f"taskset -cp {cpu['napi4']} {pid}", silent=False)
+                exec_fg(f"{NSX} taskset -cp {cpu['napi4']} {pid}", silent=False)
 
 def change_interrupts():
     number_of_interrupts = len(os.popen("cat /proc/interrupts | grep enp.s0-").read().splitlines())
@@ -536,7 +539,7 @@ def main():
 
     if THREADED == True:
         for item in IFNAMES:
-            exec_fg(f'sh -c "echo 1 > /sys/class/net/{item}/threaded"', silent=False)
+            exec_fg(f'{NSX} sh -c "echo 1 > /sys/class/net/{item}/threaded"', silent=False)
         pin_napi_threads()
 
     change_interrupts()
@@ -550,6 +553,7 @@ def main():
             get_data()
         elif "plot" in sys.argv[1]:
             gen_plots()
+            gen_error_plots()
         else:
             print("args: data, plot, test or error")
     except KeyboardInterrupt:
@@ -561,10 +565,10 @@ def main():
         exec_fg("killall ping")
         exec_fg("killall tcpdump")
         exec_fg("killall -9 iperf")
-        exec_fg(f"ethtool -s {IFNAMES[2]} autoneg on speed 2500 duplex full", silent=False)
-        exec_fg(f"ethtool -s {IFNAMES[3]} autoneg on speed 2500 duplex full", silent=False)
+        exec_fg(f"{NSX} ethtool -s {IFNAMES[2]} autoneg on speed 2500 duplex full", silent=False)
+        exec_fg(f"{NSX} ethtool -s {IFNAMES[3]} autoneg on speed 2500 duplex full", silent=False)
         if not XDP_ERROR_TEST:
-            exec_fg(f"tc qdisc del dev {IFNAMES[2]} root netem delay 5ms", silent=False)
-            exec_fg(f"tc qdisc del dev {IFNAMES[3]} root netem delay 5ms", silent=False)
+            exec_fg(f"{NSX} tc qdisc del dev {IFNAMES[2]} root netem delay 5ms", silent=False)
+            exec_fg(f"{NSX} tc qdisc del dev {IFNAMES[3]} root netem delay 5ms", silent=False)
 
 main()
