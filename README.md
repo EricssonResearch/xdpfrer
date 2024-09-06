@@ -40,6 +40,26 @@ cd src
 make
 ```
 
+## Argument list
+
+```
+Usage: xdpfrer [OPTION...]
+
+  -e, --egress=WORD          Egress interface in IFNAME:VID format (Required)
+  -i, --ingress=WORD         Ingress interface in IFNAME:VID format (Required)
+  -m, --mode=WORD            Mode: repl or elim (Required)
+  -n, --not                  Not adding or removing R-tag. (Optional)
+  -q, --quiet                Quiet output. (Optional)
+  -?, --help                 Give this help list
+      --usage                Give a short usage message
+```
+
+__Important:__ if multiple `--egress` used, mode must be replication (`--mode=repl`) and only one `--ingress` interface can be set.
+Similarly, if the mode is elimination (`-m elim`), multiple `--ingress` but only one `--egress` parameter are allowed.
+
+For example in the `xdpfrer -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67` command can be interpreted as:
+Packets with VLAN ID `20` on the `beth0` interface are replicated to `enp4s0` and `enp7s0` interfaces with VLAN ID `66` and `67` respectively.
+
 ## Source
 
 ```
