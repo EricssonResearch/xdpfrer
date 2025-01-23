@@ -4,7 +4,7 @@
 
 #include "common.h"
 
-char LICENSE[] SEC("license") = "GPL";
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 #undef bpf_printk
 #define bpf_printk(fmt, ...)                            \
