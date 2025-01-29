@@ -46,6 +46,13 @@ cd src
 make static
 ```
 
+To build for aarch64, build the Docker image and run it. The binary xdpfrer is presented in the /tmp folder. We can copy the binary file back to our computer from the running Docker container.
+```
+docker build -f aarch64.Dockerfile -t xdpfrer .
+docker run -it --name xdpfrer xdpfrer /bin/bash
+docker cp xdpfrer:/tmp/src/xdpfrer .
+```
+
 ## Argument list
 
 ```
