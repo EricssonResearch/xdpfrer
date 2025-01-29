@@ -40,6 +40,12 @@ cd src
 make
 ```
 
+Static build is also available:
+```
+cd src
+make static
+```
+
 ## Argument list
 
 ```
