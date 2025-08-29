@@ -551,7 +551,16 @@ int main(int argc, char* argv[])
 
         for (int i = 0; i < 10; ++i) {
             clock_nanosleep(CLOCK_MONOTONIC, 0, &wait, NULL);
-            ret = bpf_prog_test_run_opts(prog_fd, NULL);
+
+            char dummy_ctx[] = "0000000000000";
+            struct bpf_test_run_opts dummy_opts = {
+                .sz = sizeof(struct bpf_test_run_opts),
+                .data_in = &dummy_ctx,
+                .data_size_in = sizeof(dummy_ctx),
+                .repeat = 1
+            };
+
+            ret = bpf_prog_test_run_opts(prog_fd, &dummy_opts);
             if (ret < 0) {
                 perror("Error while running BPF program");
                 goto end;

@@ -366,7 +366,7 @@ static inline int change_vlan(const struct xdp_md *pkt, int ifindex, bool replic
 }
 
 SEC("xdp")
-int check_reset(void)
+int check_reset(char *dummy) // unused param to satisfy verifier
 {
     bpf_for_each_map_elem(&seqrcvy_map, sequence_recovery_reset, NULL, 0);
     return 1;
