@@ -1,35 +1,32 @@
 CFLAGS=-Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-declarations -Wwrite-strings -Werror
 CC=clang
 
-ifeq ($(MAKECMDGOALS),static)
-  STATIC = -static
-  EXTRA_FLAGS = -lelf -lz -lzstd
-  TARGET = -D__TARGET_ARCH_X64
-else
-  TARGET = -D__TARGET_ARCH_X86
-endif
-
-.PHONY: all install clean static
+.PHONY: all install clean
 all: xdpfrer
-static: xdpfrer
 
 vmlinux.h:
 	sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
 
-xdpfrer.bpf.o: xdpfrer.bpf.c vmlinux.h common.h
-	$(CC) -g -O2 -target bpf $(TARGET) -c $< -o $@
+xdpfrer.bpf.o: xdpfrer.bpf.c vmlinux.h common.h bpf_common.h
+	$(CC) -g -O2 -target bpf -D__TARGET_ARCH_X86 -c $< -o $@
+
+xdppreof.bpf.o: xdppreof.bpf.c vmlinux.h common.h bpf_common.h
+	$(CC) -g -O2 -target bpf -D__TARGET_ARCH_X86 -c $< -o $@
 
 xdpfrer.skel.h: xdpfrer.bpf.o
 	sudo bpftool gen skeleton $^ > $@
 
-xdpfrer.o: xdpfrer.c xdpfrer.skel.h common.h
-	$(CC) $(STATIC) -g -O2 $(CFLAGS) -c $< -o $@
+xdppreof.skel.h: xdppreof.bpf.o
+	sudo bpftool gen skeleton $^ > $@
+
+xdpfrer.o: xdpfrer.c xdpfrer.skel.h xdppreof.skel.h common.h
+	$(CC) -g -O2 $(CFLAGS) -c $< -o $@
 
 xdpfrer: xdpfrer.o
-	$(CC) $(STATIC) -g -O2 $< -lbpf $(EXTRA_FLAGS) -o $@
+	$(CC) -g -O2 $< -lbpf -o $@
 
 install: xdpfrer
 	cp xdpfrer /usr/local/bin/
 
 clean:
-	rm *.o *.skel.h vmlinux.h xdpfrer
+	rm -f *.o *.skel.h vmlinux.h xdpfrer

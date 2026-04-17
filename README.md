@@ -1,4 +1,4 @@
-# XDP FRER
+# XDP FRER / XDP PREOF
 
 This software is an experimental partial implementation of the IEEE 802.1CB Frame Replication and Elimination for Reliability standard.
 The implementation uses the XDP packet processing subsystem of the Linux kernel, which can be configured with BPF.
@@ -40,12 +40,6 @@ cd src
 make
 ```
 
-Static build is also available:
-```
-cd src
-make static
-```
-
 To build for aarch64, build the Docker image and run it. The binary xdpfrer is presented in the /tmp folder. We can copy the binary file back to our computer from the running Docker container.
 ```
 docker build -f aarch64.Dockerfile -t xdpfrer .
@@ -58,20 +52,45 @@ docker cp xdpfrer:/tmp/src/xdpfrer .
 ```
 Usage: xdpfrer [OPTION...]
 
-  -e, --egress=WORD          Egress interface in IFNAME:VID format (Required)
-  -i, --ingress=WORD         Ingress interface in IFNAME:VID format (Required)
-  -m, --mode=WORD            Mode: repl or elim (Required)
-  -n, --not                  Not adding or removing R-tag. (Optional)
-  -q, --quiet                Quiet output. (Optional)
-  -?, --help                 Give this help list
-      --usage                Give a short usage message
+ Required options:
+  -e, --egress=WORD          Egress interface in IFNAME:VID (FRER) or
+                             IFNAME:ADDR (PREOF) format.
+  -i, --ingress=WORD         Ingress interface in IFNAME:VID (FRER) or
+                             IFNAME:FLOW_ID (PREOF) format.
+  -m, --mode=WORD            Mode: repl/elim (FRER) or prf/pef (PREOF).
+
+ Optional:
+  -d, --dmac=MAC             Destination MAC address for PREOF mode
+                             (XX:XX:XX:XX:XX:XX). Default value is
+                             02:00:00:00:00:01.
+  -n, --not                  Don't add or remove R-tag.
+  -q, --quiet                Quiet output.
+
+  -h, --help                 Show this help message.
 ```
 
-__Important:__ if multiple `--egress` used, mode must be replication (`--mode=repl`) and only one `--ingress` interface can be set.
-Similarly, if the mode is elimination (`-m elim`), multiple `--ingress` but only one `--egress` parameter are allowed.
+__Important:__ if multiple `--egress` used, mode must be replication (`--mode=repl` or `--mode=prf`) and only one `--ingress` interface can be set.
+Similarly, if the mode is elimination (`-m elim` or `-m pef`), multiple `--ingress` but only one `--egress` parameter are allowed.
+`-m` must be specified before `-i` and `-e`.
 
-For example in the `xdpfrer -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67` command can be interpreted as:
-Packets with VLAN ID `20` on the `beth0` interface are replicated to `enp4s0` and `enp7s0` interfaces with VLAN ID `66` and `67` respectively.
+### FRER examples
+
+`xdpfrer -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67` means:
+Packets with VLAN ID 20 arriving on beth0 are replicated to enp4s0 with VLAN ID 66 and enp7s0 with VLAN ID 67.
+
+And `xdpfrer -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20` means:
+Packets with VLAN ID 55 on enp4s0 and VLAN ID 56 on enp7s0 are received, duplicates are eliminated,
+and only the first instance is forwarded to beth0 with VLAN ID 20.
+
+### PREOF examples
+
+`xdpfrer -m prf -i ethBA:10 -e veth0:5f00:0:0:e:: -e veth0:5f00:0:0:e:: -d 02:00:00:00:00:01` means:
+IPv6 packets with flow label 10 arriving on ethBA are encapsulated with an outer IPv6 header carrying a PREOF SID
+and two replicas are sent out through veth0, each with the same destination locator (5f00:0:0:e::).
+
+And `xdpfrer -m pef -i ethED:10 -e veth0::: -d 02:00:00:00:00:01` means:
+Encapsulated packets with flow ID 10 on ethED are decapsulated, duplicates are eliminated,
+and only the first instance is forwarded to veth0 with destination MAC 02:00:00:00:00:01.
 
 ## Source
 
@@ -80,17 +99,22 @@ Packets with VLAN ID `20` on the `beth0` interface are replicated to `enp4s0` an
 ├── README.md
 ├── src
 │   ├── aarch64.Dockerfile // Dockerfile for cross-compilation on aarch64
-│   ├── common.h           // Shared data structures and defines
-│   ├── Makefile           // GNU make file
-│   ├── xdpfrer.bpf.c      // XDP programs and BPF map definitions
-│   └── xdpfrer.c          // Configure and load the BPF part to the kernel
+│   ├── bpf_common.h       // BPF map definitions and shared structures
+│   ├── common.h           // Shared data structures and defines
+│   ├── Makefile           // GNU make file
+│   ├── xdpfrer.bpf.c      // XDP programs for FRER (replication/elimination)
+│   ├── xdpfrer.c          // Configure and load the BPF part to the kernel
+│   └── xdppreof.bpf.c     // XDP programs for PREOF (SRv6-based)
 └── test
     ├── measurement.py     // All-in-one testing and plotting script
+    ├── env.py             // Mininet-based test environment setup for SRV6-PREOF
     ├── physical.env       // Network config/environment for real testbed
     └── veth.env           // Full network config for veth/namespace based testbed
 ```
 
 ## Environment:
+
+### FRER: veth-based environment
 
 `physical.env` and `veth.env` contains this environment. Obviously you can modify vlans when you start running xdpfrer instances.
 
@@ -111,7 +135,32 @@ Packets with VLAN ID `20` on the `beth0` interface are replicated to `enp4s0` an
                     └───────────────────────────────────────────────────┘                    
 ```
 
+### PREOF: Mininet-based environment
+
+`env.py` sets up a Mininet-based environment with IPv6/SRv6 addressing for PREOF testing.
+
+```
+                    ┌───────────────────────────────────────┐                                                                      ┌───────────────────────────────────────┐                    
+                    │                  nb                   │                                                                      │                  ne                   │                    
+                    │            ┌────────────┐             │                                                                      │            ┌────────────┐             │                    
+                    │            │     lo     │             │                                                                      │            │     lo     │             │                    
+                    │            │5f00:0:0:b::│             │                                                                      │            │5f00:0:0:e::│             │                    
+┌────────────────┐  │            └────────────┘             │  ┌──────────────────────────────┐  ┌──────────────────────────────┐  │            └────────────┘             │  ┌────────────────┐
+│       na       │  │┌─────────────────┐ ┌─────────────────┐│  │              nc              │  │              nd              │  │┌─────────────────┐ ┌─────────────────┐│  │       nf       │
+│ ┌────────────┐ │  ││      veth0      │ │      veth1      ││  │        ┌────────────┐        │  │        ┌────────────┐        │  ││      veth0      │ │      veth1      ││  │ ┌────────────┐ │
+│ │     lo     │ │  ││02:00:00:00:00:00├─┤02:00:00:00:00:01││  │        │     lo     │        │  │        │     lo     │        │  ││02:00:00:00:00:00├─┤02:00:00:00:00:01││  │ │     lo     │ │
+│ │5f00:0:0:a::│ │  │└────────────────▲┘ └─────────────────┘│  │        │5f00:0:0:c::│        │  │        │5f00:0:0:d::│        │  │└────────────────▲┘ └─────────────────┘│  │ │5f00:0:0:f::│ │
+│ └────────────┘ │  │                 │                     │  │        └────────────┘        │  │        └────────────┘        │  │                 │                     │  │ └────────────┘ │
+│ ┌──────────────┤  ├──────────────┐ xdpfrer ┌──────────────┤  ├──────────────┐┌──────────────┤  ├──────────────┐┌──────────────┤  ├──────────────┐ xdpfrer ┌──────────────┤  ├──────────────┐ │
+│ │    ethAB     │  │    ethBA     │  repl   │     ethBC    │  │    ethCB     ││     ethCD    │  │     ethDC    ││     ethDE    │  │     ethED    │  elim   │     ethEF    │  │     ethFE    │ │
+│ │5f00:0:0:ab::a├──┤5f00:0:0:ab::b├──┘      │5f00:0:0:bc::b├──┤5f00:0:0:bc::c││5f00:0:0:cd::c├──┤5f00:0:0:cd::d││5f00:0:0:de::d├──┤5f00:0:0:de::e├──┘      │5f00:0:0:ef::e├──┤5f00:0:0:ef::f│ │
+│ └──────────────┤  ├──────────────┘         └──────────────┤  ├──────────────┘└──────────────┤  ├──────────────┘└──────────────┤  ├──────────────┘         └──────────────┤  ├──────────────┘ │
+└────────────────┘  └───────────────────────────────────────┘  └──────────────────────────────┘  └──────────────────────────────┘  └───────────────────────────────────────┘  └────────────────┘
+```
+
 ## Usage
+
+### FRER mode (veth-based)
 
 For basic usage a GNU/Linux system required with BPF and XDP support.
 
@@ -157,30 +206,59 @@ tx ping 10.0.0.2 -c 4
 ```
 # 4.
 #  (veth.env) root:test# nsx ../src/xdpfrer -m repl -i aeth0:10 -e enp3s0:55 -e enp6s0:56
-#  Config replication on interface aeth0 (ifindex: 2) match vlan 10
-#  Received packets: 0
-#  Received packets: 1
-#  Received packets: 2
-#  Received packets: 3
-#  Received packets: 4
-#  Received packets: 4
-#  Received packets: 4
+#  Config replication on interface aeth0 (ifindex: 2) match id 10
+#  Received: 0
+#  Received: 1
+#  Received: 2
+#  Received: 3
+#  Received: 4
+#  Received: 4
+#  Received: 4
 
 #  (veth.env) root:test# nsx ../src/xdpfrer -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20
-#  Config recovery on iface enp4s0 (ifindex: 3) match vlan 20
-#  Config recovery on iface enp7s0 (ifindex: 5) match vlan 20
-#  Passed 0, Dropped 0
-#  Passed 1, Dropped 1
-#  Passed 2, Dropped 2
-#  Passed 3, Dropped 3
-#  Passed 4, Dropped 4
-#  Passed 4, Dropped 4
+#  Config recovery on iface enp4s0 (ifindex: 3) match id 20
+#  Config recovery on iface enp7s0 (ifindex: 5) match id 20
+#  Passed: 0, Dropped: 0
+#  Passed: 1, Dropped: 1
+#  Passed: 2, Dropped: 2
+#  Passed: 3, Dropped: 3
+#  Passed: 4, Dropped: 4
+#  Passed: 4, Dropped: 4
 ```
 
 ```
 # 5.
 Ctrl+C # in xdpfrer terminal
 Ctrl+D # in both terminal
+```
+
+### PREOF mode (Mininet-based)
+
+1. Start the Mininet environment:
+
+This starts a Mininet CLI with the 6-node topology. Run xdpfrer replication on `nb` and elimination on `ne` from within the Mininet CLI or by attaching to the node namespaces.
+
+```
+cd test
+sudo python3 env.py
+```
+
+Use `-t` to enable tcpdump tracing on all interfaces:
+```
+sudo python3 env.py -t
+```
+
+2. From the Mininet CLI, start xdpfrer replication on `nb` and elimination on `ne`:
+
+```
+nb ../src/xdpfrer -m prf -i ethBA:10 -e veth0:5f00:0:0:e:: -e veth0:5f00:0:0:e:: -d 02:00:00:00:00:01
+ne ../src/xdpfrer -m pef -i ethED:10 -e veth0::: -d 02:00:00:00:00:01
+```
+
+3. Send a ping from `na` to `nf` with flow label 10:
+
+```
+na ping 5f00:0:0:ef::f -F 10
 ```
 
 ## Measurements:
