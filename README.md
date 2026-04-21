@@ -1,6 +1,16 @@
-# XDP FRER / XDP PREOF
+# XDP FRER / XDP PREF
 
-This software is an experimental partial implementation of the IEEE 802.1CB Frame Replication and Elimination for Reliability standard.
+This software is an experimental partial implementation of the IEEE 802.1CB FRER [standard](https://standards.ieee.org/ieee/802.1CB/5703/).
+It can replicate multiple copies of a packet over redundant network paths,
+in order to protect them from network failures.
+This function is called replication.
+There must be a receiver side, called elimination.
+The purpose of this is to accept the first copy received and drop the extra copies.
+
+* Replication and elimination with vector recovery algorithm (defined in IEEE 802.1CB)
+* Layer 2 TSN dataplane encapsulation with R-tag (IEEE 802.1CB)
+* Layer 3 DetNet dataplane encapsulation with [SRv6 Redundancy SID](https://datatracker.ietf.org/doc/draft-ietf-spring-sr-redundancy-protection/)
+
 The implementation uses the XDP packet processing subsystem of the Linux kernel, which can be configured with BPF.
 
 The details of the experiment are discussed in the following research paper:
@@ -25,7 +35,7 @@ Cite as:
 ## Requirements
 
 Debian based GNU/Linux distribution is preferred.
-Tested with Debian Bookworm and Ubuntu 23.04, 23.10.
+Tested with Debian Bookworm and Ubuntu 23.10 and above.
 
 ```
 sudo apt install build-essential gcc-multilib clang llvm linux-tools-common bpftool libbpf-dev
@@ -40,7 +50,10 @@ cd src
 make
 ```
 
-To build for aarch64, build the Docker image and run it. The binary xdpfrer is presented in the /tmp folder. We can copy the binary file back to our computer from the running Docker container.
+To build for aarch64, build the Docker image and run it.
+The binary xdpfrer is presented in the /tmp folder.
+We can copy the binary file back to host filesystem from the running Docker container.
+
 ```
 docker build -f aarch64.Dockerfile -t xdpfrer .
 docker run -it --name xdpfrer xdpfrer /bin/bash
@@ -69,28 +82,45 @@ Usage: xdpfrer [OPTION...]
   -h, --help                 Show this help message.
 ```
 
-__Important:__ if multiple `--egress` used, mode must be replication (`--mode=repl` or `--mode=prf`) and only one `--ingress` interface can be set.
-Similarly, if the mode is elimination (`-m elim` or `-m pef`), multiple `--ingress` but only one `--egress` parameter are allowed.
-`-m` must be specified before `-i` and `-e`.
+__Important:__ 
 
-### FRER examples
+* In replication modes `repl` and `prf` one or more `--egress` and only one `--ingress` interface can be used
+* In elimination modes `elim` and `pef` one or more `--ingress` and only one `--egress` interface can be used
+* More replication and elimination instances can be added runtime with the `xdpfrer-ctl` helper tool.
+The format of the command line arguments are the same as the `xdpfrer` case.
+
+## Examples
+
+### FRER (Layer 2)
 
 `xdpfrer -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67` means:
-Packets with VLAN ID 20 arriving on beth0 are replicated to enp4s0 with VLAN ID 66 and enp7s0 with VLAN ID 67.
+Packets with VLAN ID 20 arriving on `beth0` are replicated to `enp4s0` with VLAN ID 66 and `enp7s0` with VLAN ID 67.
 
 And `xdpfrer -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20` means:
-Packets with VLAN ID 55 on enp4s0 and VLAN ID 56 on enp7s0 are received, duplicates are eliminated,
-and only the first instance is forwarded to beth0 with VLAN ID 20.
+Packets with VLAN ID 55 on `enp4s0` and VLAN ID 56 on `enp7s0` are received, duplicates are eliminated,
+and only the first copy is forwarded to `beth0` with VLAN ID 20.
 
-### PREOF examples
+Using different VLAN IDs on the redundant paths is recommended.
+With that, per-VLAN STP instances can be used.
+Without that the egress interfaces of the redundant path(s) might be disabled by the STP,
+which would make the replication unreliable.
+
+### PREF (Layer 3)
 
 `xdpfrer -m prf -i ethBA:10 -e veth0:5f00:0:0:e:: -e veth0:5f00:0:0:e:: -d 02:00:00:00:00:01` means:
-IPv6 packets with flow label 10 arriving on ethBA are encapsulated with an outer IPv6 header carrying a PREOF SID
-and two replicas are sent out through veth0, each with the same destination locator (5f00:0:0:e::).
+IPv6 packets with flow label 10 arriving on `ethBA7` are encapsulated with an outer IPv6 header carrying a Redundancy SID
+and two replicas are sent out through `veth0`, each with the same destination locator (`5f00:0:0:e::`).
 
 And `xdpfrer -m pef -i ethED:10 -e veth0::: -d 02:00:00:00:00:01` means:
-Encapsulated packets with flow ID 10 on ethED are decapsulated, duplicates are eliminated,
-and only the first instance is forwarded to veth0 with destination MAC 02:00:00:00:00:01.
+Encapsulated packets with flow ID 10 on `ethED` are decapsulated, duplicates are eliminated,
+and only the first instance is forwarded to `veth0` with destination MAC 02:00:00:00:00:01.
+
+In this implementation of the Layer 3 case the `xdpfrer` nodes should be the
+SRv6 tunnel endpoints.
+This achieved by configuring Linux with veth interfaces with MAC addresses and
+`xdpfrer` set the destination MAC addresses of the ingress packets (with matching flow labels) to that address.
+With that the node accept the packet for further Layer 3 processing e.g.: routing, SRv6 operations or
+perform ARP or ND if needed.
 
 ## Source
 
@@ -112,7 +142,7 @@ and only the first instance is forwarded to veth0 with destination MAC 02:00:00:
     └── veth.env           // Full network config for veth/namespace based testbed
 ```
 
-## Environment:
+## Test environment:
 
 ### FRER: veth-based environment
 
@@ -137,7 +167,7 @@ and only the first instance is forwarded to veth0 with destination MAC 02:00:00:
 
 ### PREOF: Mininet-based environment
 
-`env.py` sets up a Mininet-based environment with IPv6/SRv6 addressing for PREOF testing.
+`env.py` sets up a Mininet-based environment with IPv6/SRv6 addressing for PREF testing.
 
 ```
                     ┌───────────────────────────────────────┐                                                                      ┌───────────────────────────────────────┐                    
@@ -236,19 +266,21 @@ Ctrl+D # in both terminal
 
 1. Start the Mininet environment:
 
-This starts a Mininet CLI with the 6-node topology. Run xdpfrer replication on `nb` and elimination on `ne` from within the Mininet CLI or by attaching to the node namespaces.
+This starts a Mininet CLI with the 6-node topology.
+Run `xdpfrer` replication on `nb` and elimination on `ne` from within the Mininet CLI or by attaching to the node namespaces.
 
 ```
 cd test
 sudo python3 env.py
 ```
 
-Use `-t` to enable tcpdump tracing on all interfaces:
+Optionally use `-t` to enable `tcpdump` tracing on all interfaces:
+
 ```
 sudo python3 env.py -t
 ```
 
-2. From the Mininet CLI, start xdpfrer replication on `nb` and elimination on `ne`:
+2. From the Mininet CLI, start `xdpfrer` replication on `nb` and elimination on `ne`:
 
 ```
 nb ../src/xdpfrer -m prf -i ethBA:10 -e veth0:5f00:0:0:e:: -e veth0:5f00:0:0:e:: -d 02:00:00:00:00:01
@@ -263,7 +295,8 @@ na ping 5f00:0:0:ef::f -F 10
 
 ## Measurements:
 
-For advanced usage, take a look at the test/measurement.py script. It is possible to run XDP FRER on a real, physical testbed, just change the interface names and VLAN IDs and the script accordingly.
+For advanced usage, take a look at the `test/measurement.py` script.
+It is possible to run XDP FRER/PREF on a real, physical testbed, just change the interface names and VLAN IDs and the script accordingly.
 
 First, run common tests or error tests:
 ```
