@@ -48,6 +48,7 @@ sudo apt install build-essential gcc-multilib clang llvm linux-tools-common bpft
 ```
 cd src
 make
+make install
 ```
 
 To build for aarch64, build the Docker image and run it.
@@ -165,7 +166,7 @@ perform ARP or ND if needed.
                     └───────────────────────────────────────────────────┘                    
 ```
 
-### PREOF: Mininet-based environment
+### PREF: Mininet-based environment
 
 `env.py` sets up a Mininet-based environment with IPv6/SRv6 addressing for PREF testing.
 
@@ -192,106 +193,118 @@ perform ARP or ND if needed.
 
 ### FRER mode (veth-based)
 
-For basic usage a GNU/Linux system required with BPF and XDP support.
+1. **Set up the test environment:**
 
-1. Open some terminal and source the `env` file which configure the whole network: network namespaces acting as talker, switch and listener, including the virtual interfaces and links.
-2. Run the `xdpfrer` instances inside the switch namespace (use the `nsx` alias)
-3. Open up another root terminal, source the `env` file, and start a ping command from talker to listener
-4. If everything OK, the ping successful and the XDP forwarding works properly
-5. To cleanup, press `Ctrl+D` or type `exit` to exit from terminals. The last terminal cleanup the environment
+   Open a terminal and source the environment file. This creates network namespaces for the talker, switch, and listener, along with all virtual interfaces and links.
 
-The commands:
+   ```
+   cd test
+   sudo su
+   source veth.env
+   ```
 
-```
-# 1.
-cd test
-sudo su
-source veth.env
-```
+2. **Start xdpfrer inside the switch namespace:**
 
-```
-# 2.1 (tx -> lx)
-nsx ../src/xdpfrer -m repl -i aeth0:10 -e enp3s0:55 -e enp6s0:56
-nsx ../src/xdpfrer -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20
+   Use the `nsx` alias to run replication and elimination instances in both directions:
 
-# 2.2 (lx -> tx)
-nsx ../src/xdpfrer -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67
-nsx ../src/xdpfrer -m elim -i enp3s0:66 -i enp6s0:67 -e aeth0:10
-```
+   ```
+   # tx -> lx
+   nsx xdpfrer -m repl -i aeth0:10 -e enp3s0:55 -e enp6s0:56
+   nsx xdpfrer -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20
 
-```
-# 3.
-cd test
-sudo su
-source veth.env
+   # lx -> tx
+   nsx xdpfrer -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67
+   nsx xdpfrer -m elim -i enp3s0:66 -i enp6s0:67 -e aeth0:10
+   ```
 
-tx ping 10.0.0.2 -c 4
-#  PING 10.0.0.2 (10.0.0.2) 56(84) bytes of data.
-#  64 bytes from 10.0.0.2: icmp_seq=1 ttl=64 time=0.044 ms
-#  64 bytes from 10.0.0.2: icmp_seq=2 ttl=64 time=0.056 ms
-#  64 bytes from 10.0.0.2: icmp_seq=3 ttl=64 time=0.055 ms
-#  64 bytes from 10.0.0.2: icmp_seq=4 ttl=64 time=0.057 ms
-```
+3. **Test connectivity:**
 
-```
-# 4.
-#  (veth.env) root:test# nsx ../src/xdpfrer -m repl -i aeth0:10 -e enp3s0:55 -e enp6s0:56
-#  Config replication on interface aeth0 (ifindex: 2) match id 10
-#  Received: 0
-#  Received: 1
-#  Received: 2
-#  Received: 3
-#  Received: 4
-#  Received: 4
-#  Received: 4
+   In a second root terminal, source the environment file and ping from the talker to the listener:
 
-#  (veth.env) root:test# nsx ../src/xdpfrer -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20
-#  Config recovery on iface enp4s0 (ifindex: 3) match id 20
-#  Config recovery on iface enp7s0 (ifindex: 5) match id 20
-#  Passed: 0, Dropped: 0
-#  Passed: 1, Dropped: 1
-#  Passed: 2, Dropped: 2
-#  Passed: 3, Dropped: 3
-#  Passed: 4, Dropped: 4
-#  Passed: 4, Dropped: 4
-```
+   ```
+   cd test
+   sudo su
+   source veth.env
 
-```
-# 5.
-Ctrl+C # in xdpfrer terminal
-Ctrl+D # in both terminal
-```
+   tx ping 10.0.0.2 -c 4
+   ```
 
-### PREOF mode (Mininet-based)
+4. **Verify the output:**
 
-1. Start the Mininet environment:
+   If everything works, the ping succeeds and the xdpfrer terminals show replication and elimination activity:
 
-This starts a Mininet CLI with the 6-node topology.
-Run `xdpfrer` replication on `nb` and elimination on `ne` from within the Mininet CLI or by attaching to the node namespaces.
+   ```
+   # Replicator output:
+   #  Config replication on interface aeth0 (ifindex: 2) match id 10
+   #  Received: 0
+   #  Received: 1
+   #  ...
 
-```
-cd test
-sudo python3 env.py
-```
+   # Eliminator output:
+   #  Config recovery on iface enp4s0 (ifindex: 3) match id 20
+   #  Passed: 1, Dropped: 1
+   #  Passed: 2, Dropped: 2
+   #  ...
+   ```
 
-Optionally use `-t` to enable `tcpdump` tracing on all interfaces:
+5. **Clean up:**
 
-```
-sudo python3 env.py -t
-```
+   Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
 
-2. From the Mininet CLI, start `xdpfrer` replication on `nb` and elimination on `ne`:
+### PREF mode (Mininet-based)
 
-```
-nb ../src/xdpfrer -m prf -i ethBA:10 -e veth0:5f00:0:0:e:: -e veth0:5f00:0:0:e:: -d 02:00:00:00:00:01
-ne ../src/xdpfrer -m pef -i ethED:10 -e veth0::: -d 02:00:00:00:00:01
-```
+1. **Start the Mininet environment:**
 
-3. Send a ping from `na` to `nf` with flow label 10:
+   Launch the 6-node topology using the provided script. From within the Mininet CLI (or by attaching to node namespaces), you can run xdpfrer instances.
 
-```
-na ping 5f00:0:0:ef::f -F 10
-```
+   ```
+   cd test
+   sudo python3 env.py
+   ```
+
+   To enable tcpdump tracing on all interfaces, add the `-t` flag:
+   ```
+   sudo python3 env.py -t
+   ```
+
+2. **Start xdpfrer on the replication and elimination nodes:**
+
+   In the Mininet CLI, configure `nb` for replication and `ne` for elimination:
+
+   ```
+   nb xdpfrer -m prf -i ethBA:10 -e veth0:5f00:0:0:e:: -e veth0:5f00:0:0:e:: -d 02:00:00:00:00:01
+   ne xdpfrer -m pef -i ethED:10 -e veth0::: -d 02:00:00:00:00:01
+   ```
+
+3. **Test connectivity:**
+
+   Send a ping from `na` to `nf`. Use flow label 10 to test the replication/elimination path, or omit it to verify normal forwarding:
+
+   ```
+   na ping 5f00:0:0:ef::f -F 10  # replicated and eliminated
+   na ping 5f00:0:0:ef::f        # normal forwarding
+   ```
+
+4. **Manage flows at runtime:**
+
+   Once `xdpfrer` is running, you can dynamically manage flows using `xdpfrer-ctl` without restarting `xdpfrer`.
+
+   **List active flows** on a node:
+   ```
+   nb xdpfrer-ctl list
+   ```
+
+   **Add a new flow** — for example, replicating a second flow (flow ID 11) on `nb` and eliminating it on `ne`:
+   ```
+   nb xdpfrer-ctl add -m prf -i ethBA:11 -e veth0:5f00:0:0:e:: -e veth0:5f00:0:0:e::
+   ne xdpfrer-ctl add -m pef -i ethED:11 -e veth0:::
+   ```
+
+   **Remove a flow** when it is no longer needed:
+   ```
+   nb xdpfrer-ctl del -m prf -i ethBA:11
+   ne xdpfrer-ctl del -m pef -i ethED:11
+   ```
 
 ## Measurements:
 

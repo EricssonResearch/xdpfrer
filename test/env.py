@@ -102,9 +102,10 @@ def start_network():
 
     check_ret(net, ret, section_label)
 
-    section_label = '*** Enabling seg6... '
+    section_label = '*** Enabling seg6 and mount bpffs... '
     info(section_label)
     for n in [na, nb, nc, nd, ne, nf]:
+        ret += run_cmd(n, "mount -t bpf bpf /sys/fs/bpf")
         ret += run_cmd(n, "echo 1 > /proc/sys/net/ipv6/conf/all/forwarding")
         ret += run_cmd(n, "echo 1 > /proc/sys/net/ipv6/conf/all/seg6_enabled")
 
@@ -124,7 +125,7 @@ def start_network():
     # nb forward (via nc)
     ret += run_cmd(nb, "ip -6 r a 5f00:0:0:cd::/64 via 5f00:0:0:bc::c dev ethBC")
     ret += run_cmd(nb, "ip -6 r a 5f00:0:0:de::/64 via 5f00:0:0:bc::c dev ethBC")
-    ##################ret += run_cmd(nb, "ip -6 r a 5f00:0:0:ef::/64 via 5f00:0:0:bc::c dev ethBC")
+    ret += run_cmd(nb, "ip -6 r a 5f00:0:0:ef::/64 via 5f00:0:0:bc::c dev ethBC")
     ret += run_cmd(nb, "ip -6 r a 5f00:0:0:c::/64 via 5f00:0:0:bc::c dev ethBC")
     ret += run_cmd(nb, "ip -6 r a 5f00:0:0:d::/64 via 5f00:0:0:bc::c dev ethBC")
     ret += run_cmd(nb, "ip -6 r a 5f00:0:0:f::/64 via 5f00:0:0:bc::c dev ethBC")

@@ -2,7 +2,7 @@ CFLAGS=-Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-declarations -Wwrite
 CC=clang
 
 .PHONY: all install clean
-all: xdpfrer
+all: xdpfrer xdpfrer-ctl
 
 vmlinux.h:
 	sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
@@ -25,8 +25,15 @@ xdpfrer.o: xdpfrer.c xdpfrer.skel.h xdppreof.skel.h common.h
 xdpfrer: xdpfrer.o
 	$(CC) -g -O2 $< -lbpf -o $@
 
-install: xdpfrer
+xdpfrer-ctl.o: xdpfrer-ctl.c common.h
+	$(CC) -g -O2 $(CFLAGS) -c $< -o $@
+
+xdpfrer-ctl: xdpfrer-ctl.o
+	$(CC) -g -O2 $< -lbpf -o $@
+
+install: xdpfrer xdpfrer-ctl
 	cp xdpfrer /usr/local/bin/
+	cp xdpfrer-ctl /usr/local/bin/
 
 clean:
-	rm -f *.o *.skel.h vmlinux.h xdpfrer
+	rm -f *.o *.skel.h vmlinux.h xdpfrer xdpfrer-ctl

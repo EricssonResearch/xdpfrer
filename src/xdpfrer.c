@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 
 #include "common.h"
 #include "xdpfrer.skel.h"
@@ -19,6 +20,7 @@
 #define MAX_IFACES 16
 #define MAX_IFNAME_LEN 16
 #define MAX_CFG_ENTRIES 16
+#define PIN_DIR "/sys/fs/bpf/xdpfrer"
 
 enum program_mode mode;
 static bool run;
@@ -89,6 +91,9 @@ struct skel_fds {
     int replicate_tx_map;
     int seqrcvy_map;
     int eliminate_tx_map;
+    int dst_addr_map;
+    int rvt_map;
+    int evt_map;
     int replicate_prog;
     int eliminate_prog;
     int postprocessing_prog;
@@ -333,6 +338,63 @@ static void cleanup(void)
             }
         }
     }
+}
+
+/**
+ * @brief Pin a single BPF map to PIN_DIR.
+ * @param map The BPF map to pin.
+ * @param name The map name (used as filename).
+ * @return 0 on success, -1 on failure.
+ */
+static int pin_map(struct bpf_map *map, const char *name)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", PIN_DIR, name);
+    unlink(path);
+    
+    int ret = bpf_map__pin(map, path);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to pin %s: %s\n", name, strerror(-ret));
+        return -1;
+    }
+    
+    return 0;
+}
+
+/**
+ * @brief Pin a BPF program fd to PIN_DIR.
+ */
+static int pin_prog(int prog_fd, const char *name)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", PIN_DIR, name);
+    unlink(path);
+
+    int ret = bpf_obj_pin(prog_fd, path);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to pin prog %s: %s\n", name, strerror(-ret));
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief Unpin all known maps and remove the pin directory.
+ */
+static void unpin_maps(void)
+{
+    const char *names[] = { "seqgen_map", "replicate_tx_map", "seqrcvy_map",
+                            "eliminate_tx_map", "rvt", "evt", "dst_addr_map",
+                            "postprocessing_prog" };
+    unsigned short names_size = sizeof(names)/sizeof(names[0]);
+
+    for (unsigned short i = 0; i < names_size; i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%s", PIN_DIR, names[i]);
+        unlink(path);
+    }
+    rmdir(PIN_DIR);
 }
 
 /**
@@ -668,6 +730,9 @@ int main(int argc, char* argv[])
         fds.replicate_tx_map = bpf_map__fd(frer_skel->maps.replicate_tx_map);
         fds.seqrcvy_map = bpf_map__fd(frer_skel->maps.seqrcvy_map);
         fds.eliminate_tx_map = bpf_map__fd(frer_skel->maps.eliminate_tx_map);
+        fds.dst_addr_map = -1;
+        fds.rvt_map = bpf_map__fd(frer_skel->maps.rvt);
+        fds.evt_map = bpf_map__fd(frer_skel->maps.evt);
         fds.replicate_prog = bpf_program__fd(frer_skel->progs.replicate);
         fds.eliminate_prog = bpf_program__fd(frer_skel->progs.eliminate);
         fds.postprocessing_prog = bpf_program__fd(frer_skel->progs.replicate_postprocessing);
@@ -691,6 +756,9 @@ int main(int argc, char* argv[])
         fds.replicate_tx_map = bpf_map__fd(preof_skel->maps.replicate_tx_map);
         fds.seqrcvy_map = bpf_map__fd(preof_skel->maps.seqrcvy_map);
         fds.eliminate_tx_map = bpf_map__fd(preof_skel->maps.eliminate_tx_map);
+        fds.dst_addr_map = bpf_map__fd(preof_skel->maps.dst_addr_map);
+        fds.rvt_map = -1;
+        fds.evt_map = -1;
         fds.replicate_prog = bpf_program__fd(preof_skel->progs.replicate);
         fds.eliminate_prog = bpf_program__fd(preof_skel->progs.eliminate);
         fds.postprocessing_prog = bpf_program__fd(preof_skel->progs.replicate_postprocessing);
@@ -700,6 +768,20 @@ int main(int argc, char* argv[])
         bss_passed = &preof_skel->bss->passed;
         bss_dropped = &preof_skel->bss->dropped;
         bss_unmatched = &preof_skel->bss->unmatched;
+
+        // Pinning maps
+        if (mkdir(PIN_DIR, 0700) && errno != EEXIST) {
+            fprintf(stderr, "Failed to mkdir %s: %s\n", PIN_DIR, strerror(errno));
+            ret = EXIT_FAILURE;
+            goto end;
+        }
+
+        pin_map(preof_skel->maps.seqgen_map, "seqgen_map");
+        pin_map(preof_skel->maps.replicate_tx_map, "replicate_tx_map");
+        pin_map(preof_skel->maps.seqrcvy_map, "seqrcvy_map");
+        pin_map(preof_skel->maps.eliminate_tx_map, "eliminate_tx_map");
+        pin_map(preof_skel->maps.dst_addr_map, "dst_addr_map");
+        pin_prog(fds.postprocessing_prog, "postprocessing_prog");
     }
 
     ret = config_progs(&fds);
@@ -707,20 +789,19 @@ int main(int argc, char* argv[])
         goto end;
 
     if (mode == FRER_REPL || mode == FRER_ELIM) {
-        int rvt_fd = bpf_map__fd(frer_skel->maps.rvt);
-        ret = setup_vlan_translation(rvt_fd, rvt, rvt_size);
+        ret = setup_vlan_translation(fds.rvt_map, rvt, rvt_size);
         if (ret < 0)
             goto end;
-        
-        int evt_fd = bpf_map__fd(frer_skel->maps.evt);
-        ret = setup_vlan_translation(evt_fd, evt, evt_size);
+
+        ret = setup_vlan_translation(fds.evt_map, evt, evt_size);
         if (ret < 0)
             goto end;
     } else {
-        int dst_addr_map_fd = bpf_map__fd(preof_skel->maps.dst_addr_map);
-        ret = setup_ip_translation(dst_addr_map_fd, egress_ifaces, egress_size, ingress_ifaces[0].flow_id);
-        if (ret < 0)
-            goto end;
+        if (mode == PREOF_REPL) {
+            ret = setup_ip_translation(fds.dst_addr_map, egress_ifaces, egress_size, ingress_ifaces[0].flow_id);
+            if (ret < 0)
+                goto end;
+        }
     }
 
     prog_fd = fds.check_reset_prog;
@@ -765,6 +846,8 @@ int main(int argc, char* argv[])
 end:
     printf("Exiting...\n");
     cleanup();
+    if (preof_skel)
+        unpin_maps();
     if (frer_skel)
         xdpfrer_bpf__destroy(frer_skel);
     if (preof_skel)
