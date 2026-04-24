@@ -192,9 +192,8 @@ static inline int add_outer_ipv6(struct xdp_md *pkt, int flow_label, uint16_t se
     outer->saddr = orig_saddr;
 
     // Build PREOF SID as destination address
-    // psid->loc is set in postprocessing
+    // psid->loc and psid->funct are set in postprocessing
     struct preof_sid *psid = (struct preof_sid *)&outer->daddr;
-    psid->funct = bpf_htons(0x0000);
     psid->flow_id = flow_label;
     psid->seq = seq;
     psid->reserved = 0;
@@ -294,6 +293,7 @@ int replicate_postprocessing(struct xdp_md *pkt)
     struct preof_sid *psid = (struct preof_sid *)&outer->daddr;
     struct preof_sid *src = (struct preof_sid *)addr;
     psid->loc = src->loc;
+    psid->funct = src->funct;
 
     bpf_printk("[Repl postprocessing] pass");
     return XDP_PASS;
