@@ -174,11 +174,11 @@ static inline bool recover(struct seq_rcvy_and_hist *rec, ushort seq)
         rec->rogue_packets += 1;
         rec->discarded_packets += 1;
     } else if (delta <= 0) {
-        if (-delta != FRER_DEFAULT_HIST_LEN) // error check for the sake of the verifier
+        if (-delta >= FRER_DEFAULT_HIST_LEN) // error check for the sake of the verifier
             goto drop;
 
-        if (((history_window >> -delta) & 1LU) == 0) { // checking -deltath bit
-            history_window |= (1UL << -delta); // set the deltath bit to 1
+        if (((history_window >> (FRER_DEFAULT_HIST_LEN - 1 + delta)) & 1LU) == 0) { // check bit for this seq
+            history_window |= (1UL << (FRER_DEFAULT_HIST_LEN - 1 + delta)); // set the bit
             rec->out_of_order_packets += 1;
             rec->passed_packets += 1;
             goto pass;
