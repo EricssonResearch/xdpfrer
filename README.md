@@ -1,6 +1,16 @@
-# XDP FRER
+# XDP FRER / XDP PREF
 
-This software is an experimental partial implementation of the IEEE 802.1CB Frame Replication and Elimination for Reliability standard.
+This software is an experimental partial implementation of the IEEE 802.1CB FRER [standard](https://standards.ieee.org/ieee/802.1CB/5703/).
+It can replicate multiple copies of a packet over redundant network paths,
+in order to protect them from network failures.
+This function is called replication.
+There must be a receiver side, called elimination.
+The purpose of this is to accept the first copy received and drop the extra copies.
+
+* Replication and elimination with vector recovery algorithm (defined in IEEE 802.1CB)
+* Layer 2 TSN dataplane encapsulation with R-tag (IEEE 802.1CB)
+* Layer 3 DetNet dataplane encapsulation with [SRv6 Redundancy SID](https://datatracker.ietf.org/doc/draft-ietf-spring-sr-redundancy-protection/)
+
 The implementation uses the XDP packet processing subsystem of the Linux kernel, which can be configured with BPF.
 
 The details of the experiment are discussed in the following research paper:
@@ -25,7 +35,7 @@ Cite as:
 ## Requirements
 
 Debian based GNU/Linux distribution is preferred.
-Tested with Debian Bookworm and Ubuntu 23.04, 23.10.
+Tested with Debian Bookworm and Ubuntu 23.10 and above.
 
 ```
 sudo apt install build-essential gcc-multilib clang llvm linux-tools-common bpftool libbpf-dev
@@ -38,15 +48,13 @@ sudo apt install build-essential gcc-multilib clang llvm linux-tools-common bpft
 ```
 cd src
 make
+make install
 ```
 
-Static build is also available:
-```
-cd src
-make static
-```
+To build for aarch64, build the Docker image and run it.
+The binary xdpfrer is presented in the /tmp folder.
+We can copy the binary file back to host filesystem from the running Docker container.
 
-To build for aarch64, build the Docker image and run it. The binary xdpfrer is presented in the /tmp folder. We can copy the binary file back to our computer from the running Docker container.
 ```
 docker build -f aarch64.Dockerfile -t xdpfrer .
 docker run -it --name xdpfrer xdpfrer /bin/bash
@@ -58,20 +66,62 @@ docker cp xdpfrer:/tmp/src/xdpfrer .
 ```
 Usage: xdpfrer [OPTION...]
 
-  -e, --egress=WORD          Egress interface in IFNAME:VID format (Required)
-  -i, --ingress=WORD         Ingress interface in IFNAME:VID format (Required)
-  -m, --mode=WORD            Mode: repl or elim (Required)
-  -n, --not                  Not adding or removing R-tag. (Optional)
-  -q, --quiet                Quiet output. (Optional)
-  -?, --help                 Give this help list
-      --usage                Give a short usage message
+ Required options:
+  -e, --egress=WORD          Egress interface in IFNAME:VID (FRER) or
+                             IFNAME:ADDR (PREOF) format.
+  -i, --ingress=WORD         Ingress interface in IFNAME:VID (FRER) or
+                             IFNAME:FLOW_ID (PREOF) format.
+  -m, --mode=WORD            Mode: repl/elim (FRER) or prf/pef (PREOF).
+
+ Optional:
+  -d, --dmac=MAC             Destination MAC address for PREOF mode
+                             (XX:XX:XX:XX:XX:XX). Default value is
+                             02:00:00:00:00:01.
+  -n, --not                  Don't add or remove R-tag.
+  -q, --quiet                Quiet output.
+
+  -h, --help                 Show this help message.
 ```
 
-__Important:__ if multiple `--egress` used, mode must be replication (`--mode=repl`) and only one `--ingress` interface can be set.
-Similarly, if the mode is elimination (`-m elim`), multiple `--ingress` but only one `--egress` parameter are allowed.
+__Important:__ 
 
-For example in the `xdpfrer -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67` command can be interpreted as:
-Packets with VLAN ID `20` on the `beth0` interface are replicated to `enp4s0` and `enp7s0` interfaces with VLAN ID `66` and `67` respectively.
+* In replication modes `repl` and `prf` one or more `--egress` and only one `--ingress` interface can be used
+* In elimination modes `elim` and `pef` one or more `--ingress` and only one `--egress` interface can be used
+* More replication and elimination instances can be added runtime with the `xdpfrer-ctl` helper tool.
+The format of the command line arguments are the same as the `xdpfrer` case.
+
+## Examples
+
+### FRER (Layer 2)
+
+`xdpfrer -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67` means:
+Packets with VLAN ID 20 arriving on `beth0` are replicated to `enp4s0` with VLAN ID 66 and `enp7s0` with VLAN ID 67.
+
+And `xdpfrer -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20` means:
+Packets with VLAN ID 55 on `enp4s0` and VLAN ID 56 on `enp7s0` are received, duplicates are eliminated,
+and only the first copy is forwarded to `beth0` with VLAN ID 20.
+
+Using different VLAN IDs on the redundant paths is recommended.
+With that, per-VLAN STP instances can be used.
+Without that the egress interfaces of the redundant path(s) might be disabled by the STP,
+which would make the replication unreliable.
+
+### PREF (Layer 3)
+
+`xdpfrer -m prf -i ethBA:10 -e veth0:5f00:0:0:e:: -e veth0:5f00:0:0:e:: -d 02:00:00:00:00:01` means:
+IPv6 packets with flow label 10 arriving on `ethBA` are encapsulated with an outer IPv6 header carrying a Redundancy SID
+and two replicas are sent out through `veth0`, each with the same destination locator (`5f00:0:0:e::`).
+
+And `xdpfrer -m pef -i ethED:10 -e veth0::: -d 02:00:00:00:00:01` means:
+Encapsulated packets with flow ID 10 on `ethED` are decapsulated, duplicates are eliminated,
+and only the first instance is forwarded to `veth0` with destination MAC 02:00:00:00:00:01.
+
+In this implementation of the Layer 3 case the `xdpfrer` nodes should be the
+SRv6 tunnel endpoints.
+This achieved by configuring Linux with veth interfaces with MAC addresses and
+`xdpfrer` set the destination MAC addresses of the ingress packets (with matching flow labels) to that address.
+With that the node accept the packet for further Layer 3 processing e.g.: routing, SRv6 operations or
+perform ARP or ND if needed.
 
 ## Source
 
@@ -80,17 +130,26 @@ Packets with VLAN ID `20` on the `beth0` interface are replicated to `enp4s0` an
 ├── README.md
 ├── src
 │   ├── aarch64.Dockerfile // Dockerfile for cross-compilation on aarch64
-│   ├── common.h           // Shared data structures and defines
-│   ├── Makefile           // GNU make file
-│   ├── xdpfrer.bpf.c      // XDP programs and BPF map definitions
-│   └── xdpfrer.c          // Configure and load the BPF part to the kernel
+│   ├── bpf_common.h       // BPF map definitions and shared structures
+│   ├── common.h           // Shared data structures and defines
+│   ├── Makefile           // GNU make file
+│   ├── xdpfrer.bpf.c      // XDP programs for FRER (replication/elimination)
+│   ├── xdpfrer.c          // Configure and load the BPF part to the kernel
+│   └── xdppreof.bpf.c     // XDP programs for PREOF (SRv6-based)
 └── test
+    ├── development
+    │   ├── srv6_test.py   // 6-node SRv6 PREF topology (Mininet)
+    │   ├── srv6_test.env  // 6-node SRv6 PREF topology (bash)
+    │   └── README.md      // Detailed SRv6 PREF internals
     ├── measurement.py     // All-in-one testing and plotting script
-    ├── physical.env       // Network config/environment for real testbed
-    └── veth.env           // Full network config for veth/namespace based testbed
+    ├── srv6.env           // 9-node SRv6 PREF topology (bash)
+    ├── physical.env       // FRER environment for physical testbed
+    └── veth.env           // FRER environment using veth pairs and namespaces
 ```
 
-## Environment:
+## Test environment:
+
+### FRER: veth-based environment
 
 `physical.env` and `veth.env` contains this environment. Obviously you can modify vlans when you start running xdpfrer instances.
 
@@ -111,81 +170,154 @@ Packets with VLAN ID `20` on the `beth0` interface are replicated to `enp4s0` an
                     └───────────────────────────────────────────────────┘                    
 ```
 
+### PREF: veth-based environment
+
+`srv6.env` contains this 9-node topology with two redundant paths: `a` (n3-n4) and `b` (n5-n6-n7).
+`n2` replicates packets to both paths; `n8` eliminates duplicates. Normal (non-replicated) traffic is forwarded via path `a`.
+IPv6 loopback addresses follow the node name (e.g., `n3` has `5f00:0:0:3::`).
+Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `n2`–`n3` link.
+
+```
+                                         "a" path                                         
+                                                                                          
+                                5f00:0:0:3::  5f00:0:0:4::                                
+                                 ┌────────┐    ┌────────┐                                 
+                                 │        │    │        │                                 
+                            ┌────┤   n3   ├────┤   n4   ├────┐                            
+                            │    │        │    │        │    │                            
+                            │    └────────┘    └────────┘    │                            
+  ┌────────┐   ┌────────┐   │                                │    ┌────────┐   ┌────────┐ 
+  │        │   │        ├───┘                                └────┤        │   │        │ 
+  │   n1   ├───┤   n2   │                                         │   n8   ├───┤   n9   │ 
+  │        │   │   prf  ├─┐                                    ┌──┤   pef  │   │        │ 
+  └────────┘   └────────┘ │                                    │  └────────┘   └────────┘ 
+5f00:0:0:1::  5f00:0:0:2::│ ┌────────┐  ┌────────┐  ┌────────┐ │5f00:0:0:8::  5f00:0:0:9::
+                          │ │        │  │        │  │        │ │                          
+                          └─┤   n5   ├──┤   n6   ├──┤   n7   ├─┘                          
+                            │        │  │        │  │        │                            
+                            └────────┘  └────────┘  └────────┘                            
+                          5f00:0:0:5:: 5f00:0:0:6:: 5f00:0:0:7::                          
+                                                                                          
+                                         "b" path                                         
+```
+
 ## Usage
 
-For basic usage a GNU/Linux system required with BPF and XDP support.
+### FRER mode
 
-1. Open some terminal and source the `env` file which configure the whole network: network namespaces acting as talker, switch and listener, including the virtual interfaces and links.
-2. Run the `xdpfrer` instances inside the switch namespace (use the `nsx` alias)
-3. Open up another root terminal, source the `env` file, and start a ping command from talker to listener
-4. If everything OK, the ping successful and the XDP forwarding works properly
-5. To cleanup, press `Ctrl+D` or type `exit` to exit from terminals. The last terminal cleanup the environment
+1. **Set up the test environment:**
 
-The commands:
+   Open a terminal and source the environment file. This creates network namespaces for the talker, switch, and listener, along with all virtual interfaces and links.
 
-```
-# 1.
-cd test
-sudo su
-source veth.env
-```
+   ```
+   cd test
+   sudo su
+   source veth.env
+   ```
 
-```
-# 2.1 (tx -> lx)
-nsx ../src/xdpfrer -m repl -i aeth0:10 -e enp3s0:55 -e enp6s0:56
-nsx ../src/xdpfrer -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20
+2. **Start xdpfrer inside the switch namespace:**
 
-# 2.2 (lx -> tx)
-nsx ../src/xdpfrer -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67
-nsx ../src/xdpfrer -m elim -i enp3s0:66 -i enp6s0:67 -e aeth0:10
-```
+   Use the `nsx` alias to run replication and elimination instances in both directions:
 
-```
-# 3.
-cd test
-sudo su
-source veth.env
+   ```
+   # tx -> lx
+   nsx xdpfrer -m repl -i aeth0:10 -e enp3s0:55 -e enp6s0:56
+   nsx xdpfrer -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20
 
-tx ping 10.0.0.2 -c 4
-#  PING 10.0.0.2 (10.0.0.2) 56(84) bytes of data.
-#  64 bytes from 10.0.0.2: icmp_seq=1 ttl=64 time=0.044 ms
-#  64 bytes from 10.0.0.2: icmp_seq=2 ttl=64 time=0.056 ms
-#  64 bytes from 10.0.0.2: icmp_seq=3 ttl=64 time=0.055 ms
-#  64 bytes from 10.0.0.2: icmp_seq=4 ttl=64 time=0.057 ms
-```
+   # lx -> tx
+   nsx xdpfrer -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67
+   nsx xdpfrer -m elim -i enp3s0:66 -i enp6s0:67 -e aeth0:10
+   ```
 
-```
-# 4.
-#  (veth.env) root:test# nsx ../src/xdpfrer -m repl -i aeth0:10 -e enp3s0:55 -e enp6s0:56
-#  Config replication on interface aeth0 (ifindex: 2) match vlan 10
-#  Received packets: 0
-#  Received packets: 1
-#  Received packets: 2
-#  Received packets: 3
-#  Received packets: 4
-#  Received packets: 4
-#  Received packets: 4
+3. **Test connectivity:**
 
-#  (veth.env) root:test# nsx ../src/xdpfrer -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20
-#  Config recovery on iface enp4s0 (ifindex: 3) match vlan 20
-#  Config recovery on iface enp7s0 (ifindex: 5) match vlan 20
-#  Passed 0, Dropped 0
-#  Passed 1, Dropped 1
-#  Passed 2, Dropped 2
-#  Passed 3, Dropped 3
-#  Passed 4, Dropped 4
-#  Passed 4, Dropped 4
-```
+   Ping from the talker to the listener:
 
-```
-# 5.
-Ctrl+C # in xdpfrer terminal
-Ctrl+D # in both terminal
-```
+   ```
+   tx ping 10.0.0.2 -c 4
+   ```
+
+4. **Verify the output:**
+
+   If everything works, the ping succeeds and the xdpfrer terminals show replication and elimination activity:
+
+   ```
+   # Replicator output:
+   #  Config replication on interface aeth0 (ifindex: 2) match id 10
+   #  Received: 0
+   #  Received: 1
+   #  ...
+
+   # Eliminator output:
+   #  Config recovery on iface enp4s0 (ifindex: 3) match id 20
+   #  Passed: 1, Dropped: 1
+   #  Passed: 2, Dropped: 2
+   #  ...
+   ```
+
+5. **Clean up:**
+
+   Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
+
+### PREF mode
+
+1. **Start the environment:**
+
+   Open a terminal and source the environment file. This creates the 9-node topology with network namespaces, veth pairs, IPv6 addressing, and SRv6 routing.
+
+   ```
+   cd test
+   sudo su
+   source srv6.env
+   ```
+
+2. **Start xdpfrer on the replication and elimination nodes:**
+
+   Configure `n2` for replication and `n8` for elimination:
+
+   ```
+   n2 xdpfrer -m prf -i eth21:10 -e veth0:5f00:0:0:8:a:: -e veth2:5f00:0:0:8:b:: -d 02:00:00:00:00:01
+   n8 xdpfrer -m pef -i eth84:10 -i eth87:10 -e veth0::: -d 02:00:00:00:00:01
+   ```
+
+3. **Test connectivity:**
+
+   Ping from `n1` to `n9`. Use flow label 10 to test the replication/elimination path, or omit it to verify normal forwarding:
+
+   ```
+   n1 ping 5f00:0:0:89::9 -F 10  # replicated and eliminated
+   n1 ping 5f00:0:0:89::9        # normal forwarding
+   ```
+
+4. **Manage flows at runtime:**
+
+   Once `xdpfrer` is running, you can dynamically manage flows using `xdpfrer-ctl` without restarting `xdpfrer`.
+
+   **List active flows** on a node:
+   ```
+   n2 xdpfrer-ctl list
+   ```
+
+   **Add a new flow** — for example, replicating a second flow (flow ID 11) on `n2` and eliminating it on `n8`:
+   ```
+   n2 xdpfrer-ctl add -m prf -i eth21:11 -e veth0:5f00:0:0:8:a:: -e veth2:5f00:0:0:8:b::
+   n8 xdpfrer-ctl add -m pef -i eth84:11 -i eth87:11 -e veth0:::
+   ```
+
+   **Remove a flow** when it is no longer needed:
+   ```
+   n2 xdpfrer-ctl del -m prf -i eth21:11
+   n8 xdpfrer-ctl del -m pef -i eth84:11
+   ```
+
+5. **Clean up:**
+
+   Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
 
 ## Measurements:
 
-For advanced usage, take a look at the test/measurement.py script. It is possible to run XDP FRER on a real, physical testbed, just change the interface names and VLAN IDs and the script accordingly.
+For advanced usage, take a look at the `test/measurement.py` script.
+It is possible to run XDP FRER/PREF on a real, physical testbed, just change the interface names and VLAN IDs and the script accordingly.
 
 First, run common tests or error tests:
 ```

@@ -1,10 +1,11 @@
 #ifndef _H_COMMON
 #define _H_COMMON
 
-// HST = history window, sequence number, take any
-// 0th-46th bit means the history window
-// 47th-62nd bit means the sequence number
-// 63rd means the take any
+// HST = history window, sequence number, TakeAny
+// Bit-packed layout for sequence recovery state:
+// Bits  0-46: history window (SequenceHistory)
+// Bits 47-62: recovery sequence number (RecovSeqNum)
+// Bit     63: TakeAny flag
 typedef uint64_t HST;
 #define TAKE_ANY 63
 #define SEQ_START_BIT 47
@@ -17,11 +18,19 @@ typedef uint64_t HST;
 #define CLOCK_MONOTONIC 1
 #endif
 
+// VLAN ID translation: from one VID to another on an interface.
 struct vlan_translation_entry {
     int from;
     int to;
 };
 
+// BPF map key for per-egress, per-flow lookups.
+struct tx_key {
+    int ifidx;
+    int flow_label;
+};
+
+// Sequence recovery state and statistics, shared between BPF programs via seqrcvy_map.
 struct seq_rcvy_and_hist {
     unsigned reset_msec;
     bool individual_recovery;
@@ -41,20 +50,23 @@ struct seq_rcvy_and_hist {
     int latent_error_resets;
 
     unsigned long last_packet_ns;
+#ifdef __bpf__
     struct bpf_spin_lock lock;
+#endif
 };
 
+// Sequence number generator state, shared between BPF programs via seqgen_map.
 struct seq_gen {
     int gen_seq_num;
     int resets;
 };
 
 /**
- * @brief Calculates the distance between `seq1` and `seq2`. Sequence numbers can be between 0 to 65535. This function
+ * @brief Calculate the distance between `seq1` and `seq2`. Sequence numbers can be between 0 to 65535. This function
  * can calculate the difference at the end of a cycle.
- * @param seq1 is a sequence number
- * @param seq2 is a sequence number
- * @return the distance between the two sequence numbers
+ * @param seq1 A sequence number.
+ * @param seq2 A sequence number.
+ * @return The distance between the two sequence numbers.
  */
 static inline int calc_delta(ushort seq1, ushort seq2)
 {
