@@ -109,7 +109,7 @@ static inline int rm_rtag(struct xdp_md *pkt, ushort *seq)
     *seq = bpf_ntohs(rtag->seq);
 
     // Remove the R-tag
-    if (add_or_rm_rtag) {
+    if (!no_encap) {
         __builtin_memmove(data + rtaghdr_sz, data, ethhdr_sz + vlanhdr_sz);
         if (bpf_xdp_adjust_head(pkt, (int)rtaghdr_sz))
             return -1;
@@ -186,7 +186,7 @@ int replicate(struct xdp_md *pkt)
     if (!gen)
         return XDP_DROP;
 
-    if (add_or_rm_rtag) {
+    if (!no_encap) {
         uint16_t seq = gen_seq(gen);
         int ret = add_rtag(pkt, &seq);
         if (ret < 0)

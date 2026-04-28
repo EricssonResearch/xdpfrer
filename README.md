@@ -77,7 +77,8 @@ Usage: xdpfrer [OPTION...]
   -d, --dmac=MAC             Destination MAC address for PREOF mode
                              (XX:XX:XX:XX:XX:XX). Default value is
                              02:00:00:00:00:01.
-  -n, --not                  Don't add or remove R-tag.
+  -n, --not                  Don't add/remove R-tag (FRER) or don't
+                             encapsulate/decapsulate (PREOF).
   -q, --quiet                Quiet output.
 
   -h, --help                 Show this help message.
@@ -133,6 +134,7 @@ perform ARP or ND if needed.
 │   ├── bpf_common.h       // BPF map definitions and shared structures
 │   ├── common.h           // Shared data structures and defines
 │   ├── Makefile           // GNU make file
+│   ├── xdpfrer-ctl.c      // Runtime flow management tool for PREF mode
 │   ├── xdpfrer.bpf.c      // XDP programs for FRER (replication/elimination)
 │   ├── xdpfrer.c          // Configure and load the BPF part to the kernel
 │   └── xdppreof.bpf.c     // XDP programs for PREOF (SRv6-based)
@@ -143,11 +145,12 @@ perform ARP or ND if needed.
     │   └── README.md      // Detailed SRv6 PREF internals
     ├── measurement.py     // All-in-one testing and plotting script
     ├── srv6.env           // 9-node SRv6 PREF topology (bash)
+    ├── srv6_multi_pef.env // 7-node SRv6 PREF topology with multiple elimination (bash)
     ├── physical.env       // FRER environment for physical testbed
     └── veth.env           // FRER environment using veth pairs and namespaces
 ```
 
-## Test environment:
+## Test environments and usage
 
 ### FRER: veth-based environment
 
@@ -169,41 +172,6 @@ perform ARP or ND if needed.
                     │                                                   │                    
                     └───────────────────────────────────────────────────┘                    
 ```
-
-### PREF: veth-based environment
-
-`srv6.env` contains this 9-node topology with two redundant paths: `a` (n3-n4) and `b` (n5-n6-n7).
-`n2` replicates packets to both paths; `n8` eliminates duplicates. Normal (non-replicated) traffic is forwarded via path `a`.
-IPv6 loopback addresses follow the node name (e.g., `n3` has `5f00:0:0:3::`).
-Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `n2`–`n3` link.
-
-```
-                                         "a" path                                         
-                                                                                          
-                                5f00:0:0:3::  5f00:0:0:4::                                
-                                 ┌────────┐    ┌────────┐                                 
-                                 │        │    │        │                                 
-                            ┌────┤   n3   ├────┤   n4   ├────┐                            
-                            │    │        │    │        │    │                            
-                            │    └────────┘    └────────┘    │                            
-  ┌────────┐   ┌────────┐   │                                │    ┌────────┐   ┌────────┐ 
-  │        │   │        ├───┘                                └────┤        │   │        │ 
-  │   n1   ├───┤   n2   │                                         │   n8   ├───┤   n9   │ 
-  │        │   │   prf  ├─┐                                    ┌──┤   pef  │   │        │ 
-  └────────┘   └────────┘ │                                    │  └────────┘   └────────┘ 
-5f00:0:0:1::  5f00:0:0:2::│ ┌────────┐  ┌────────┐  ┌────────┐ │5f00:0:0:8::  5f00:0:0:9::
-                          │ │        │  │        │  │        │ │                          
-                          └─┤   n5   ├──┤   n6   ├──┤   n7   ├─┘                          
-                            │        │  │        │  │        │                            
-                            └────────┘  └────────┘  └────────┘                            
-                          5f00:0:0:5:: 5f00:0:0:6:: 5f00:0:0:7::                          
-                                                                                          
-                                         "b" path                                         
-```
-
-## Usage
-
-### FRER mode
 
 1. **Set up the test environment:**
 
@@ -259,7 +227,36 @@ Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `
 
    Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
 
-### PREF mode
+### PREF: basic veth-based environment
+
+`srv6.env` contains this 9-node topology with two redundant paths: `a` (n3-n4) and `b` (n5-n6-n7).
+`n2` replicates packets to both paths; `n8` eliminates duplicates. Normal (non-replicated) traffic is forwarded via path `a`.
+IPv6 loopback addresses follow the node name (e.g., `n3` has `5f00:0:0:3::`).
+Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `n2`–`n3` link.
+
+```
+                                         "a" path                                         
+                                                                                          
+                                5f00:0:0:3::  5f00:0:0:4::                                
+                                 ┌────────┐    ┌────────┐                                 
+                                 │        │    │        │                                 
+                            ┌────┤   n3   ├────┤   n4   ├────┐                            
+                            │    │        │    │        │    │                            
+                            │    └────────┘    └────────┘    │                            
+  ┌────────┐   ┌────────┐   │                                │    ┌────────┐   ┌────────┐ 
+  │        │   │        ├───┘                                └────┤        │   │        │ 
+  │   n1   ├───┤   n2   │                                         │   n8   ├───┤   n9   │ 
+  │        │   │   prf  ├─┐                                    ┌──┤   pef  │   │        │ 
+  └────────┘   └────────┘ │                                    │  └────────┘   └────────┘ 
+5f00:0:0:1::  5f00:0:0:2::│ ┌────────┐  ┌────────┐  ┌────────┐ │5f00:0:0:8::  5f00:0:0:9::
+                          │ │        │  │        │  │        │ │                          
+                          └─┤   n5   ├──┤   n6   ├──┤   n7   ├─┘                          
+                            │        │  │        │  │        │                            
+                            └────────┘  └────────┘  └────────┘                            
+                          5f00:0:0:5:: 5f00:0:0:6:: 5f00:0:0:7::                          
+                                                                                          
+                                         "b" path                                         
+```
 
 1. **Start the environment:**
 
@@ -311,6 +308,57 @@ Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `
    ```
 
 5. **Clean up:**
+
+   Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
+
+### PREF: multiple elimination
+
+`srv6_multi_pef.env` contains this 7-node topology with three redundant paths: `a` (n3-n5), `b` (n4-n5), and `c` (direct n2-n6).
+`n2` replicates packets to all three paths; `n5` performs intermediate elimination, `n6` performs final elimination.
+The `-n` flag on `n5` removes SRH and rewrites the outer IPv6 destination address.
+
+```
+                               ┌────────┐                                       
+                     "a" path  │        │                                       
+                   ┌───────────┤   n3   ├─┐ ┌────────┐                          
+                   │           │        │ │ │        │                          
+                   │           └────────┘ └─┤   n5   │                          
+                   │           ┌────────┐ ┌─┤   pef  ├─┐                        
+                   │  "b" path │        │ │ └────────┘ │                        
+                   │ ┌─────────┤   n4   ├─┘            │                        
+┌────────┐   ┌─────┴─┴┐        │        │              │ ┌────────┐   ┌────────┐
+│        │   │        │        └────────┘              │ │        │   │        │
+│   n1   ├───┤   n2   │                                └─┤   n6   ├───┤   n7   │
+│        │   │   prf  ├──────────────────────────────────┤   pef  │   │        │
+└────────┘   └────────┘             "c" path             └────────┘   └────────┘
+```
+
+1. **Start the environment:**
+
+   ```
+   cd test
+   sudo su
+   source srv6_multi_pef.env
+   ```
+
+2. **Start xdpfrer on the replication and elimination nodes:**
+
+   Configure `n2` for replication, `n5` for intermediate elimination (with `-n`), and `n6` for final elimination:
+
+   ```
+   n2 xdpfrer -m prf -i eth21:10 -e veth0:5f00:0:0:5:a:: -e veth2:5f00:0:0:5:b:: -e veth4:5f00:0:0:6:c::
+   n5 xdpfrer -m pef -i eth53:10 -i eth54:10 -e veth0:5f00:0:0:6:: -n
+   n6 xdpfrer -m pef -i eth65:10 -i eth62:10 -e veth0:::
+   ```
+
+3. **Test connectivity:**
+
+   ```
+   n1 ping 5f00:0:0:67::7 -F 10  # replicated and eliminated
+   n1 ping 5f00:0:0:67::7        # normal forwarding
+   ```
+
+4. **Clean up:**
 
    Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
 

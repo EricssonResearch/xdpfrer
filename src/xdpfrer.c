@@ -30,7 +30,7 @@ static unsigned int evt_size = 0;
 static unsigned int cfg_size = 0;
 static unsigned int ingress_size = 0;
 static unsigned int egress_size = 0;
-static bool add_or_rm_rtag = true;
+static bool no_encap = false;
 static bool quiet_output = false;
 static unsigned char dst_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
 
@@ -664,7 +664,7 @@ static int parse_opt(int key, char *arg, struct argp_state *state) {
             egress_size++;
             break;
         case 'n':
-            add_or_rm_rtag = false;
+            no_encap = true;
             break;
         case 'q':
             quiet_output = true;
@@ -704,7 +704,7 @@ int main(int argc, char* argv[])
         { 0, 0, 0, 0, "Optional:", 2},
         { "dmac", 'd', "MAC", 0, "Destination MAC address for PREOF mode (XX:XX:XX:XX:XX:XX). " \
           "Default value is 02:00:00:00:00:01.", 2},
-        { "not", 'n', 0, 0, "Don't add or remove R-tag.", 2},
+        { "not", 'n', 0, 0, "Don't add/remove R-tag (FRER) or don't encapsulate/decapsulate (PREOF).", 2},
         { "quiet", 'q', 0, 0, "Quiet output.", 2},
         { "help", 'h', 0, 0, "Show this help message.", 3},
         { 0 }
@@ -724,7 +724,7 @@ int main(int argc, char* argv[])
             ret = EXIT_FAILURE;
             goto end;
         }
-        frer_skel->data->add_or_rm_rtag = add_or_rm_rtag;
+        frer_skel->bss->no_encap = no_encap;
 
         fds.seqgen_map = bpf_map__fd(frer_skel->maps.seqgen_map);
         fds.replicate_tx_map = bpf_map__fd(frer_skel->maps.replicate_tx_map);
@@ -751,6 +751,7 @@ int main(int argc, char* argv[])
             goto end;
         }
         __builtin_memcpy(preof_skel->data->dst_mac, dst_mac, 6);
+        preof_skel->bss->no_encap = no_encap;
 
         fds.seqgen_map = bpf_map__fd(preof_skel->maps.seqgen_map);
         fds.replicate_tx_map = bpf_map__fd(preof_skel->maps.replicate_tx_map);
@@ -798,6 +799,11 @@ int main(int argc, char* argv[])
             goto end;
     } else {
         if (mode == PREOF_REPL) {
+            ret = setup_ip_translation(fds.dst_addr_map, egress_ifaces, egress_size, ingress_ifaces[0].flow_id);
+            if (ret < 0)
+                goto end;
+        }
+        if (mode == PREOF_ELIM && no_encap) {
             ret = setup_ip_translation(fds.dst_addr_map, egress_ifaces, egress_size, ingress_ifaces[0].flow_id);
             if (ret < 0)
                 goto end;

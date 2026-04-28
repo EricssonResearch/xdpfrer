@@ -64,12 +64,12 @@ static inline int read_preof_sid(struct xdp_md *pkt, uint32_t *flow_id, uint32_t
 }
 
 /**
- * @brief Remove the outer IPv6 header (and SRH if present) from the packet, preserving the
- * Ethernet header. Restores the EtherType based on the inner next header value.
+ * @brief Remove the SRH from the packet, keeping the Ethernet and outer IPv6 headers.
+ * Updates the outer IPv6 nexthdr and payload_len fields accordingly. If no SRH is present, nothing happens.
  * @param pkt The packet with headers.
- * @return 0 if successful, -1 if the packet is invalid or the header removal failed.
+ * @return 0 if successful, -1 if the packet is invalid.
  */
-static inline int rm_outer_ipv6(struct xdp_md *pkt)
+static inline int rm_srh(struct xdp_md *pkt)
 {
     void *data = (void *)(long) pkt->data;
     void *data_end = (void *)(long) pkt->data_end;
@@ -77,39 +77,71 @@ static inline int rm_outer_ipv6(struct xdp_md *pkt)
         return -1;
 
     struct ipv6hdr *outer = data + ethhdr_sz;
-    uint8_t inner_nexthdr;
+    if (outer->nexthdr != 43)
+        return 0;
 
-    if (outer->nexthdr == 43) {
-        uint8_t *srh_start = (uint8_t *)outer + ipv6hdr_sz;
-        if ((void *)srh_start + 2 > data_end)
-            return -1;
-        inner_nexthdr = srh_start[0];
-        uint8_t hdrlen = srh_start[1];
+    uint8_t *srh_start = (uint8_t *)outer + ipv6hdr_sz;
+    if ((void *)srh_start + 2 > data_end)
+        return -1;
 
-        int strip_sz;
-        switch (hdrlen) {
-            case 2: strip_sz = 40 + 24;  break; // 1 segment
-            case 4: strip_sz = 40 + 40;  break; // 2 segments
-            case 6: strip_sz = 40 + 56;  break; // 3 segments
-            case 8: strip_sz = 40 + 72;  break; // 4 segments
-            case 10: strip_sz = 40 + 88;  break; // 5 segments
-            case 12: strip_sz = 40 + 104;  break; // 6 segments
-            default: return -1;
-        }
+    uint8_t inner_nexthdr = srh_start[0];
+    uint8_t hdrlen = srh_start[1];
 
-        if (data + ethhdr_sz + strip_sz + ethhdr_sz > data_end)
-            return -1;
-        __builtin_memmove(data + strip_sz, data, ethhdr_sz);
-        if (bpf_xdp_adjust_head(pkt, strip_sz))
-            return -1;
-    } else {
-        inner_nexthdr = outer->nexthdr;
-        if (data + ethhdr_sz + ipv6hdr_sz + ethhdr_sz > data_end)
-            return -1;
-        __builtin_memmove(data + ipv6hdr_sz, data, ethhdr_sz);
-        if (bpf_xdp_adjust_head(pkt, (int)ipv6hdr_sz))
-            return -1;
+    int srh_sz;
+    switch (hdrlen) {
+        case 2:  srh_sz = 24;  break;
+        case 4:  srh_sz = 40;  break;
+        case 6:  srh_sz = 56;  break;
+        case 8:  srh_sz = 72;  break;
+        case 10: srh_sz = 88;  break;
+        case 12: srh_sz = 104; break;
+        default: return -1;
     }
+
+    int keep_sz = ethhdr_sz + ipv6hdr_sz;
+    if (data + keep_sz + srh_sz > data_end)
+        return -1;
+
+    __builtin_memmove(data + srh_sz, data, keep_sz);
+    if (bpf_xdp_adjust_head(pkt, srh_sz))
+        return -1;
+
+    data = (void *)(long) pkt->data;
+    data_end = (void *)(long) pkt->data_end;
+    if (data + ethhdr_sz + ipv6hdr_sz > data_end)
+        return -1;
+
+    outer = data + ethhdr_sz;
+    outer->nexthdr = inner_nexthdr;
+    outer->payload_len = bpf_htons(bpf_ntohs(outer->payload_len) - srh_sz);
+
+    return 0;
+}
+
+/**
+ * @brief Remove the outer IPv6 header (and SRH if present) from the packet, preserving the
+ * Ethernet header. Restores the EtherType based on the inner next header value.
+ * @param pkt The packet with headers.
+ * @return 0 if successful, -1 if the packet is invalid or the header removal failed.
+ */
+static inline int rm_outer_ipv6(struct xdp_md *pkt)
+{
+    if (rm_srh(pkt) < 0)
+        return -1;
+
+    void *data = (void *)(long) pkt->data;
+    void *data_end = (void *)(long) pkt->data_end;
+    if (data + ethhdr_sz + ipv6hdr_sz > data_end)
+        return -1;
+
+    struct ipv6hdr *outer = data + ethhdr_sz;
+    uint8_t inner_nexthdr = outer->nexthdr;
+
+    if (data + ethhdr_sz + ipv6hdr_sz + ethhdr_sz > data_end)
+        return -1;
+    __builtin_memmove(data + ipv6hdr_sz, data, ethhdr_sz);
+    if (bpf_xdp_adjust_head(pkt, (int)ipv6hdr_sz))
+        return -1;
 
     data = (void *)(long) pkt->data;
     data_end = (void *)(long) pkt->data_end;
@@ -123,6 +155,41 @@ static inline int rm_outer_ipv6(struct xdp_md *pkt)
         eth->h_proto = bpf_htons(0x0800);
     else
         eth->h_proto = bpf_htons(0x86dd);
+
+    return 0;
+}
+
+/**
+ * @brief Rewrite the outer IPv6 header. Rewrites the destination address with the address
+ * from dst_addr_map and remove the SRH if present. Used when no_encap is set.
+ * @param pkt The packet with headers.
+ * @param flow_label The flow label used to look up the rewrite address.
+ * @return 0 if successful, -1 if the packet is too short or the address is not found.
+ */
+static inline int rewrite_outer_ipv6(struct xdp_md *pkt, uint32_t flow_label)
+{
+    int *tx_ifindex = bpf_map_lookup_elem(&eliminate_tx_map, &flow_label);
+    if (!tx_ifindex)
+        return -1;
+
+    struct tx_key k = { .ifidx = *tx_ifindex, .flow_label = flow_label };
+    struct in6_addr *addr = bpf_map_lookup_elem(&dst_addr_map, &k);
+    if (!addr)
+        return -1;
+
+    if (rm_srh(pkt) < 0)
+        return -1;
+
+    void *data = (void *)(long) pkt->data;
+    void *data_end = (void *)(long) pkt->data_end;
+    if (data + ethhdr_sz + ipv6hdr_sz > data_end)
+        return -1;
+
+    struct ipv6hdr *outer = data + ethhdr_sz;
+    struct preof_sid *psid = (struct preof_sid *)&outer->daddr;
+    struct preof_sid *src = (struct preof_sid *)addr;
+    psid->loc = src->loc;
+    psid->funct = src->funct;
 
     return 0;
 }
@@ -326,10 +393,18 @@ int eliminate(struct xdp_md *pkt)
         goto not_for_us;
     }
 
-    ret = rm_outer_ipv6(pkt);
-    if (ret < 0) {
-        bpf_printk("[Elim] Unable to remove outer IPv6 header");
-        goto drop;
+    if (no_encap) {
+        ret = rewrite_outer_ipv6(pkt, flow_label);
+        if (ret < 0) {
+            bpf_printk("[Elim] Unable to rewrite outer IPv6 destination");
+            goto drop;
+        }
+    } else {
+        ret = rm_outer_ipv6(pkt);
+        if (ret < 0) {
+            bpf_printk("[Elim] Unable to remove outer IPv6 header");
+            goto drop;
+        }
     }
 
     int *tx_ifindex = bpf_map_lookup_elem(&eliminate_tx_map, &flow_label);
