@@ -145,6 +145,7 @@ perform ARP or ND if needed.
     │   └── README.md      // Detailed SRv6 PREF internals
     ├── measurement.py     // All-in-one testing and plotting script
     ├── srv6.env           // 9-node SRv6 PREF topology (bash)
+    ├── srv6_multi_prf.env // 9-node SRv6 PREF topology with multiple replication (bash)
     ├── srv6_multi_pef.env // 7-node SRv6 PREF topology with multiple elimination (bash)
     ├── physical.env       // FRER environment for physical testbed
     └── veth.env           // FRER environment using veth pairs and namespaces
