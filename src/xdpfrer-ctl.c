@@ -34,8 +34,8 @@ static void usage(void)
         "  xdpfrer-ctl add -m elim -i IFNAME:VID [-i ...] -e IFNAME:VID\n"
         "  xdpfrer-ctl del -m repl -i IFNAME:VID\n"
         "  xdpfrer-ctl del -m elim -i IFNAME:VID\n"
-        "  xdpfrer-ctl add -m prf -i IFNAME:FLOW_ID -e IFNAME:ADDR [-e ...]\n"
-        "  xdpfrer-ctl add -m pef -i IFNAME:FLOW_ID -e IFNAME:::\n"
+        "  xdpfrer-ctl add -m prf -i IFNAME:FLOW_ID -e IFNAME:ADDR [-e ...] [-n]\n"
+        "  xdpfrer-ctl add -m pef -i IFNAME:FLOW_ID -e IFNAME::: [-n]\n"
         "  xdpfrer-ctl del -m prf -i IFNAME:FLOW_ID\n"
         "  xdpfrer-ctl del -m pef -i IFNAME:FLOW_ID\n"
         "  xdpfrer-ctl list\n");
@@ -223,9 +223,10 @@ static int cmd_del_elim(int vid)
  * @param egress Array of egress interface names.
  * @param addrs Array of destination IPv6 addresses corresponding to each egress interface.
  * @param n Number of egress interfaces.
+ * @param no_encap Encapsulate the packet or not.
  * @return 0 on success, 1 on failure.
  */
-static int cmd_add_prf(int flow_id, char egress[][MAX_IFNAME_LEN], struct in6_addr *addrs, int n)
+static int cmd_add_prf(int flow_id, char egress[][MAX_IFNAME_LEN], struct in6_addr *addrs, int n, bool no_encap)
 {
     int seqgen_fd = open_pinned("seqgen_map");
     int repl_fd = open_pinned("replicate_tx_map");
@@ -267,10 +268,10 @@ static int cmd_add_prf(int flow_id, char egress[][MAX_IFNAME_LEN], struct in6_ad
     }
     close(tx_fd);
 
-    struct seq_gen gen = {};
+    struct seq_gen gen = { .no_encap = no_encap };
     bpf_map_update_elem(seqgen_fd, &flow_id, &gen, BPF_NOEXIST);
 
-    printf("Added replication flow %d (%d egress)\n", flow_id, n);
+    printf("Added replication flow %d (%d egress%s)\n", flow_id, n, no_encap ? ", no_encap" : "");
     close(seqgen_fd); close(repl_fd); close(dst_fd);
     return 0;
 }
@@ -280,9 +281,10 @@ static int cmd_add_prf(int flow_id, char egress[][MAX_IFNAME_LEN], struct in6_ad
  * and initializes the sequence recovery state.
  * @param flow_id The flow label used as match ID.
  * @param ifname The egress interface name.
+ * @param no_encap Encapsulate the packet or not.
  * @return 0 on success, 1 on failure.
  */
-static int cmd_add_pef(int flow_id, const char *ifname)
+static int cmd_add_pef(int flow_id, const char *ifname, bool no_encap)
 {
     int rcvy_fd = open_pinned("seqrcvy_map");
     int elim_fd = open_pinned("eliminate_tx_map");
@@ -299,9 +301,10 @@ static int cmd_add_pef(int flow_id, const char *ifname)
 
     struct seq_rcvy_and_hist rec = {};
     rec.hist_recvseq_takeany = 1UL << TAKE_ANY;
+    rec.no_encap = no_encap;
     bpf_map_update_elem(rcvy_fd, &flow_id, &rec, BPF_NOEXIST);
 
-    printf("Added elimination flow %d -> %s\n", flow_id, ifname);
+    printf("Added elimination flow %d -> %s%s\n", flow_id, ifname, no_encap ? " (no_encap)" : "");
     close(rcvy_fd); close(elim_fd);
     return 0;
 }
@@ -375,7 +378,8 @@ static int print_seqgen_map(void)
     while (bpf_map_get_next_key(fd, &key, &next) == 0) {
         struct seq_gen gen;
         if (bpf_map_lookup_elem(fd, &next, &gen) == 0)
-            printf("    match_id=%d, seq=%d resets=%d\n", next, gen.gen_seq_num, gen.resets);
+            printf("    match_id=%d, seq=%d resets=%d%s\n", next, gen.gen_seq_num, gen.resets,
+                   gen.no_encap ? " no_encap" : " encap");
         key = next;
     }
     close(fd);
@@ -421,8 +425,9 @@ static int print_seqrcvy_map(void)
     while (bpf_map_get_next_key(fd, &key, &next) == 0) {
         struct seq_rcvy_and_hist rec;
         if (bpf_map_lookup_elem(fd, &next, &rec) == 0)
-            printf("    match_id=%d  passed=%d discarded=%d rogue=%d\n",
-                   next, rec.passed_packets, rec.discarded_packets, rec.rogue_packets);
+            printf("    match_id=%d  passed=%d discarded=%d rogue=%d%s\n",
+                   next, rec.passed_packets, rec.discarded_packets, rec.rogue_packets,
+                   rec.no_encap ? " no_encap" : " encap");
         key = next;
     }
     close(fd);
@@ -583,10 +588,13 @@ int main(int argc, char *argv[])
     struct in6_addr egress_addrs[MAX_IFACES];
     int egress_vids[MAX_IFACES];
     int num_egress = 0;
+    bool no_encap = false;
 
     // Parse options
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "-n") == 0) {
+            no_encap = true;
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             mode_str = argv[++i];
             if (strcmp(mode_str, "repl") == 0) {
                 mode = FRER_REPL;
@@ -677,9 +685,9 @@ int main(int argc, char *argv[])
             case FRER_ELIM:
                 return cmd_add_elim(egress_vids[0], egress_ifnames[0], ingress_ifnames, ingress_ids, num_ingress);
             case PREOF_REPL:
-                return cmd_add_prf(ingress_ids[0], egress_ifnames, egress_addrs, num_egress);
+                return cmd_add_prf(ingress_ids[0], egress_ifnames, egress_addrs, num_egress, no_encap);
             case PREOF_ELIM:
-                return cmd_add_pef(ingress_ids[0], egress_ifnames[0]);
+                return cmd_add_pef(ingress_ids[0], egress_ifnames[0], no_encap);
         }   
     } else if (strcmp(cmd, "del") == 0) {
         switch (mode) {

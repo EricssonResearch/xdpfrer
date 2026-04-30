@@ -310,7 +310,7 @@ int replicate(struct xdp_md *pkt)
     __sync_fetch_and_add(&received, 1);
 
     int ret = 0;
-    if (no_encap) {
+    if (gen->no_encap) {
         // Remove the SRH but keep the outer IPv6 header with the PREOF SID (preserving flow_id and seq).
         // The destination locator and function are rewritten per egress interface in replicate_postprocessing.
         ret = rm_srh(pkt);
@@ -403,7 +403,7 @@ int eliminate(struct xdp_md *pkt)
         goto not_for_us;
     }
 
-    if (no_encap) {
+    if (rec->no_encap) {
         ret = rewrite_outer_ipv6(pkt, flow_label);
         if (ret < 0) {
             bpf_printk("[Elim] Unable to rewrite outer IPv6 destination");

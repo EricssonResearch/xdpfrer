@@ -232,6 +232,7 @@ static int configure_replication(struct skel_fds *fds, struct config_item *cfg)
     config_xdp_prog(fds, cfg);
 
     struct seq_gen new_gen = {};
+    new_gen.no_encap = no_encap;
     ret = bpf_map_update_elem(fds->seqgen_map, &cfg->match_id, &new_gen, BPF_ADD);
     if (ret < 0) {
         fprintf(stderr, "Failed to insert sequence generator into seqgen map. Maybe already exists?\n");
@@ -276,6 +277,7 @@ static int configure_elimination(struct skel_fds *fds, struct config_item *cfg)
 
     struct seq_rcvy_and_hist new_rec = {}; // set sequence number and history window to 0
     new_rec.hist_recvseq_takeany ^= (-(true) ^ new_rec.hist_recvseq_takeany) & (1UL << TAKE_ANY); // set take_any true
+    new_rec.no_encap = no_encap;
     ret = bpf_map_update_elem(fds->seqrcvy_map, &cfg->match_id, &new_rec, BPF_ADD);
     if (ret < 0) {
         fprintf(stderr, "Failed to insert sequence recovery to elimination map. Maybe already exists?\n");
@@ -724,8 +726,6 @@ int main(int argc, char* argv[])
             ret = EXIT_FAILURE;
             goto end;
         }
-        frer_skel->bss->no_encap = no_encap;
-
         fds.seqgen_map = bpf_map__fd(frer_skel->maps.seqgen_map);
         fds.replicate_tx_map = bpf_map__fd(frer_skel->maps.replicate_tx_map);
         fds.seqrcvy_map = bpf_map__fd(frer_skel->maps.seqrcvy_map);
@@ -751,7 +751,6 @@ int main(int argc, char* argv[])
             goto end;
         }
         __builtin_memcpy(preof_skel->data->dst_mac, dst_mac, 6);
-        preof_skel->bss->no_encap = no_encap;
 
         fds.seqgen_map = bpf_map__fd(preof_skel->maps.seqgen_map);
         fds.replicate_tx_map = bpf_map__fd(preof_skel->maps.replicate_tx_map);

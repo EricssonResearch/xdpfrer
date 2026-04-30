@@ -359,7 +359,17 @@ The `-n` flag on `n4` removes the SRH while preserving the PREOF SID (flow_id an
    n1 ping 5f00:0:0:89::9        # normal forwarding
    ```
 
-4. **Clean up:**
+4. **Manage flows at runtime:**
+
+   In this example, we add flow label 11 using only path `a`, replicating packets to paths `a1` and `a2`. On `n2`, we need a command to redirect the packets to path `a` because the default route is path `b`.
+
+   ```
+   n2 xdpfrer-ctl add -m prf -i eth21:11 -e veth0:5f00:0:0:4:a::
+   n4 xdpfrer-ctl add -m prf -i eth43:11 -e veth0:5f00:0:0:8:a1:: -e veth2:5f00:0:0:8:a2:: -n
+   n8 xdpfrer-ctl add -m pef -i eth85:11 -i eth86:11 -e veth0:::
+   ```
+
+5. **Clean up:**
 
    Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
 
@@ -410,7 +420,16 @@ The `-n` flag on `n5` removes SRH and rewrites the outer IPv6 destination addres
    n1 ping 5f00:0:0:67::7        # normal forwarding
    ```
 
-4. **Clean up:**
+4. **Manage flows at runtime:**
+
+   In this example, we replicate flow 11 to path `a` and path `b`. On `n5`, elimination removes the duplicates and decapsulates the packets, so on `n6` these packets are unmatched.
+
+   ```
+   n2 xdpfrer-ctl add -m prf -i eth21:11 -e veth0:5f00:0:0:5:a:: -e veth2:5f00:0:0:5:b::
+   n5 xdpfrer-ctl add -m pef -i eth53:11 -i eth54:11 -e veth0::
+   ```
+
+5. **Clean up:**
 
    Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
 

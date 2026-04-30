@@ -58,7 +58,6 @@ volatile int received = 0;
 volatile int dropped = 0;
 volatile int passed = 0;
 volatile int unmatched = 0;
-volatile bool no_encap = false;
 
 /**
  * @brief Generate a sequence number between 0 and 65535. If it reaches 65535 then start from 0 again.

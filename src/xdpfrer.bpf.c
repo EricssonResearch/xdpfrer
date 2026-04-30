@@ -90,9 +90,10 @@ static inline int add_rtag(struct xdp_md *pkt, ushort *seq)
  * @brief Remove the R-tag from the packet's header. R-tag can be found after the VLAN ID.
  * @param pkt The packet with headers.
  * @param seq A pointer that will store the sequence number from the packet's R-tag.
+ * @param skip_remove Remove the R-tah or not.
  * @return 0 if successful, -1 if the packet is invalid or the R-tag removal failed.
  */
-static inline int rm_rtag(struct xdp_md *pkt, ushort *seq)
+static inline int rm_rtag(struct xdp_md *pkt, ushort *seq, bool skip_remove)
 {
     // Error bound check for the sake of the verifier
     void *data = (void *)(long) pkt->data;
@@ -109,7 +110,7 @@ static inline int rm_rtag(struct xdp_md *pkt, ushort *seq)
     *seq = bpf_ntohs(rtag->seq);
 
     // Remove the R-tag
-    if (!no_encap) {
+    if (!skip_remove) {
         __builtin_memmove(data + rtaghdr_sz, data, ethhdr_sz + vlanhdr_sz);
         if (bpf_xdp_adjust_head(pkt, (int)rtaghdr_sz))
             return -1;
@@ -186,7 +187,7 @@ int replicate(struct xdp_md *pkt)
     if (!gen)
         return XDP_DROP;
 
-    if (!no_encap) {
+    if (!gen->no_encap) {
         uint16_t seq = gen_seq(gen);
         int ret = add_rtag(pkt, &seq);
         if (ret < 0)
@@ -233,7 +234,7 @@ int eliminate(struct xdp_md *pkt)
         goto drop;
 
     ushort seq;
-    ret = rm_rtag(pkt, &seq);
+    ret = rm_rtag(pkt, &seq, rec->no_encap);
     if (ret < 0)
         goto drop;
 

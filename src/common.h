@@ -34,6 +34,7 @@ struct tx_key {
 struct seq_rcvy_and_hist {
     unsigned reset_msec;
     bool individual_recovery;
+    bool no_encap; // per-flow flag to determine whether to rewrite the outer header or remove it
 
     HST hist_recvseq_takeany;
 
@@ -59,6 +60,7 @@ struct seq_rcvy_and_hist {
 struct seq_gen {
     int gen_seq_num;
     int resets;
+    bool no_encap; // per-flow flag to determine whether to rewrite the outer header or remove it
 };
 
 /**
