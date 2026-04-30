@@ -311,6 +311,57 @@ Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `
 
    Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
 
+### PREF: multiple replication
+
+`srv6_multi_prf.env` contains a 9-node topology with three redundant paths: `a1` (n4–n5), `a2` (n4–n6), and `b` (n2–n7).
+`n2` replicates packets onto path `a` (via n3 to n4) and path `b` (via n7). `n4` further replicates path `a` into `a1` (via n5) and `a2` (via n6). As a result, `n8` receives three copies of the same packet and performs elimination.
+The `-n` flag on `n4` removes the SRH while preserving the PREOF SID (flow_id and sequence number) in the outer IPv6 header. The destination locator is rewritten per egress interface.
+
+```
+                                                     ┌────────┐                           
+                                            "a1" path│        │                           
+                                                  ┌──┤   n5   ├──┐                        
+                          ┌────────┐  ┌────────┐  │  │        │  │                        
+                 "a" path │        │  │        ├──┘  └────────┘  │                        
+                        ┌─┤   n3   ├──┤   n4   │     ┌────────┐  │                        
+┌────────┐   ┌────────┐ │ │        │  │   prf  ├──┐  │        │  │ ┌────────┐   ┌────────┐
+│        │   │        ├─┘ └────────┘  └────────┘  └──┤   n6   │  └─┤        │   │        │
+│   n1   ├───┤   n2   │   ┌────────┐        "a2" path│        ├────┤   n8   ├───┤   n9   │
+│        │   │   prf  ├─┐ │        │                 └────────┘  ┌─┤   pef  │   │        │
+└────────┘   └────────┘ └─┤   n7   ├─────────────────────────────┘ └────────┘   └────────┘
+                          │        │                                                      
+                 "b" path └────────┘                                                      
+```
+
+1. **Start the environment:**
+
+   ```
+   cd test
+   sudo su
+   source srv6_multi_prf.env
+   ```
+
+2. **Start xdpfrer on the replication and elimination nodes:**
+
+   Configure `n2` for replication, `n4` for intermediate replication (with `-n`), and `n8` for elimination:
+
+   ```
+   n2 xdpfrer -m prf -i eth21:10 -e veth0:5f00:0:0:4:a:: -e veth2:5f00:0:0:8:b::
+   n4 xdpfrer -m prf -i eth43:10 -e veth0:5f00:0:0:8:a1:: -e veth2:5f00:0:0:8:a2:: -n
+   n8 xdpfrer -m pef -i eth85:10 -i eth86:10 -i eth87:10 -e veth0:::
+   ```
+
+3. **Test connectivity:**
+
+   ```
+   n1 ping 5f00:0:0:89::9 -F 10  # replicated and eliminated
+   n1 ping 5f00:0:0:89::9        # normal forwarding
+   ```
+
+4. **Clean up:**
+
+   Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
+
 ### PREF: multiple elimination
 
 `srv6_multi_pef.env` contains this 7-node topology with three redundant paths: `a` (n3-n5), `b` (n4-n5), and `c` (direct n2-n6).

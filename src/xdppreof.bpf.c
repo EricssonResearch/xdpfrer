@@ -309,14 +309,24 @@ int replicate(struct xdp_md *pkt)
     // Packet matched our criteria, count it as received
     __sync_fetch_and_add(&received, 1);
 
-    uint16_t seq = gen_seq(gen);
-    bpf_printk("[Repl] generated seq %d", seq);
-
     int ret = 0;
-    ret = add_outer_ipv6(pkt, flow_label, seq);
-    if (ret < 0) {
-        bpf_printk("[Repl] add_outer_ipv6 failed");
-        goto drop;
+    if (no_encap) {
+        // Remove the SRH but keep the outer IPv6 header with the PREOF SID (preserving flow_id and seq).
+        // The destination locator and function are rewritten per egress interface in replicate_postprocessing.
+        ret = rm_srh(pkt);
+        if (ret < 0) {
+            bpf_printk("[Repl] Unable to remove SRH");
+            goto drop;
+        }
+    } else {
+        uint16_t seq = gen_seq(gen);
+        bpf_printk("[Repl] generated seq %d", seq);
+        
+        ret = add_outer_ipv6(pkt, flow_label, seq);
+        if (ret < 0) {
+            bpf_printk("[Repl] add_outer_ipv6 failed");
+            goto drop;
+        }
     }
 
     struct tx_ifaces *tx = bpf_map_lookup_elem(&replicate_tx_map, &flow_label);
