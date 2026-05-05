@@ -15,7 +15,7 @@
 
 #include "common.h"
 #include "xdpfrer.skel.h"
-#include "xdppreof.skel.h"
+#include "xdppref.skel.h"
 
 #define MAX_IFACES 16
 #define MAX_IFNAME_LEN 16
@@ -32,6 +32,7 @@ static unsigned int ingress_size = 0;
 static unsigned int egress_size = 0;
 static bool no_encap = false;
 static bool quiet_output = false;
+static unsigned int next_rcvy_idx = 0;
 static unsigned char dst_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
 
 // xdp_attach_mode from libxdp.h
@@ -49,8 +50,8 @@ enum xdp_attach_mode attach_mode = XDP_MODE_NATIVE;
 enum program_mode {
     FRER_ELIM,
     FRER_REPL,
-    PREOF_ELIM,
-    PREOF_REPL
+    PREF_ELIM,
+    PREF_REPL
 };
 
 struct egress_info {
@@ -58,16 +59,27 @@ struct egress_info {
     int ifidx;
     union {
         int vid;                   // for FRER
-        struct in6_addr dst_addr;  // for PREOF
+        struct in6_addr dst_addr;  // for PREF
     };
+};
+
+enum match_type {
+    MATCH_FL,   // Match on IPv6 flow label
+    MATCH_RSID  // Match on PREF SID function + flow_id
+};
+
+struct pref_match {
+    enum match_type mtype;
+    uint16_t funct;
+    uint32_t flow_id;
 };
 
 struct ingress_info {
     char ifname[MAX_IFNAME_LEN];
     int ifidx;
     union {
-        int vid;      // for FRER
-        int flow_id;  // for PREOF
+        int vid;                   // for FRER
+        struct pref_match pmatch; // for PREF
     };
 };
 
@@ -78,17 +90,21 @@ struct vlan_translation_table {
 
 struct config_item {
     char rx_ifname[MAX_IFNAME_LEN];
-    int match_id;
+    union {
+        int vid;                   // for FRER (VID)
+        struct pref_match pmatch; // for PREF
+    };
     enum program_mode mode;
     int num_tx_ifaces;
     char tx_ifname[MAX_IFACES][MAX_IFNAME_LEN];
     int prog_fd;
 };
 
-// Abstraction over skeleton types so config functions work with both FRER and PREOF
+// Abstraction over skeleton types so config functions work with both FRER and PREF
 struct skel_fds {
     int seqgen_map;
     int replicate_tx_map;
+    int seqrcvy_idx_map;
     int seqrcvy_map;
     int eliminate_tx_map;
     int dst_addr_map;
@@ -149,7 +165,7 @@ static inline int libbpf_print_fn(enum libbpf_print_level level, const char *for
  */
 static int config_xdp_prog(struct skel_fds *fds, struct config_item *cfg)
 {
-    int prog_fd = (cfg->mode == FRER_ELIM || cfg->mode == PREOF_ELIM)
+    int prog_fd = (cfg->mode == FRER_ELIM || cfg->mode == PREF_ELIM)
         ? fds->eliminate_prog : fds->replicate_prog;
     if (prog_fd < 0) {
         fprintf(stderr, "Error while searching for BPF program\n");
@@ -173,6 +189,20 @@ static int config_xdp_prog(struct skel_fds *fds, struct config_item *cfg)
 }
 
 /**
+ * @brief Get the BPF map key for a config item. For FRER, returns the VLAN ID.
+ * For PREF fl mode, returns the flow label. For PREF rsid mode, returns
+ * (funct << 20 | flow_id).
+ */
+static int64_t get_map_key(struct config_item *cfg)
+{
+    if (cfg->mode == FRER_REPL || cfg->mode == FRER_ELIM)
+        return (int64_t)cfg->vid;
+    if (cfg->pmatch.mtype == MATCH_RSID)
+        return ((int64_t)cfg->pmatch.funct << 20) | (cfg->pmatch.flow_id & 0xFFFFF);
+    return (int64_t)cfg->pmatch.flow_id;
+}
+
+/**
  * @brief Configure replication for a given ingress interface. Creates a devmap with the egress
  * interfaces, inserts it into the replicate map keyed by match ID, attaches the XDP program,
  * and initializes the sequence number generator.
@@ -183,17 +213,18 @@ static int config_xdp_prog(struct skel_fds *fds, struct config_item *cfg)
 static int configure_replication(struct skel_fds *fds, struct config_item *cfg)
 {
     int ret = EXIT_SUCCESS;
+    int64_t key = get_map_key(cfg);
 
     if (fds->seqgen_map < 0 || fds->replicate_tx_map < 0) {
         fprintf(stderr, "eBPF maps for replication config not found\n");
         return -EINVAL;
     }
-    printf("Config replication on interface %s (ifindex: %d) match id %d\n",
-           cfg->rx_ifname, if_nametoindex(cfg->rx_ifname), cfg->match_id);
+    printf("Config replication on interface %s (ifindex: %d) match id %ld\n",
+           cfg->rx_ifname, if_nametoindex(cfg->rx_ifname), key);
 
     const int max_tx_ifaces = 8;
     char mapname[BPF_OBJ_NAME_LEN] = { };
-    snprintf(mapname, BPF_OBJ_NAME_LEN, "id%d_txifs", cfg->match_id);
+    snprintf(mapname, BPF_OBJ_NAME_LEN, "id%ld_txifs", key);
     int tx_ifaces_map_fd = bpf_map_create(
         BPF_MAP_TYPE_DEVMAP_HASH,
         mapname, sizeof(int),
@@ -201,7 +232,7 @@ static int configure_replication(struct skel_fds *fds, struct config_item *cfg)
         max_tx_ifaces, 0
     );
     if (tx_ifaces_map_fd < 0) {
-        fprintf(stderr, "Failed to create replication devmap for match ID %d\n", cfg->match_id);
+        fprintf(stderr, "Failed to create replication devmap for match ID %ld\n", key);
         return -EINVAL;
     }
 
@@ -222,7 +253,7 @@ static int configure_replication(struct skel_fds *fds, struct config_item *cfg)
         }
     }
 
-    ret = bpf_map_update_elem(fds->replicate_tx_map, &cfg->match_id, &tx_ifaces_map_fd, 0);
+    ret = bpf_map_update_elem(fds->replicate_tx_map, &key, &tx_ifaces_map_fd, 0);
     if (ret < 0) {
         fprintf(stderr, "Failed to insert tx interfaces into replicate map. Maybe already exists?\n");
         return -EINVAL;
@@ -233,7 +264,7 @@ static int configure_replication(struct skel_fds *fds, struct config_item *cfg)
 
     struct seq_gen new_gen = {};
     new_gen.no_encap = no_encap;
-    ret = bpf_map_update_elem(fds->seqgen_map, &cfg->match_id, &new_gen, BPF_ADD);
+    ret = bpf_map_update_elem(fds->seqgen_map, &key, &new_gen, BPF_ADD);
     if (ret < 0) {
         fprintf(stderr, "Failed to insert sequence generator into seqgen map. Maybe already exists?\n");
         return -EINVAL;
@@ -248,39 +279,49 @@ static int configure_replication(struct skel_fds *fds, struct config_item *cfg)
  * number, history window and TakeAny set to true.
  * @param fds Holds the file descriptors for BPF programs and maps.
  * @param cfg A configuration entry specifying the ingress interface, match ID, and egress interface.
+ * @param rcvy_idx The shared recovery index for this elimination instance.
  * @return 0 if successful, -EINVAL if interface lookup or map update fails.
  */
-static int configure_elimination(struct skel_fds *fds, struct config_item *cfg)
+static int configure_elimination(struct skel_fds *fds, struct config_item *cfg, int rcvy_idx)
 {
     int ret = EXIT_SUCCESS;
+    int64_t key = get_map_key(cfg);
 
-    if (fds->seqrcvy_map < 0 || fds->eliminate_tx_map < 0) {
+    if (fds->seqrcvy_map < 0 || fds->seqrcvy_idx_map < 0 || fds->eliminate_tx_map < 0) {
         fprintf(stderr, "eBPF maps for elimination config not found\n");
         return -EINVAL;
     }
 
-    printf("Config recovery on iface %s (ifindex: %d) match id %d\n",
-           cfg->rx_ifname, if_nametoindex(cfg->rx_ifname), cfg->match_id);
+    printf("Config recovery on iface %s (ifindex: %d) match id %ld rcvy_idx %d\n",
+           cfg->rx_ifname, if_nametoindex(cfg->rx_ifname), key, rcvy_idx);
     int ifindex = if_nametoindex(cfg->tx_ifname[0]);
     if (!ifindex) {
         fprintf(stderr, "Failed to convert %s interface name to an index\n", cfg->tx_ifname[0]);
         return -EINVAL;
     }
 
-    ret = bpf_map_update_elem(fds->eliminate_tx_map, &cfg->match_id, &ifindex, 0);
+    ret = bpf_map_update_elem(fds->eliminate_tx_map, &key, &ifindex, 0);
     if (ret < 0) {
         fprintf(stderr, "Failed to insert %s into eliminate map. Maybe already exists?\n", cfg->tx_ifname[0]);
         return -EINVAL;
     }
 
+    // Map this ingress key to the shared history window
+    ret = bpf_map_update_elem(fds->seqrcvy_idx_map, &key, &rcvy_idx, 0);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to insert into seqrcvy_idx_map\n");
+        return -EINVAL;
+    }
+
     config_xdp_prog(fds, cfg);
 
-    struct seq_rcvy_and_hist new_rec = {}; // set sequence number and history window to 0
-    new_rec.hist_recvseq_takeany ^= (-(true) ^ new_rec.hist_recvseq_takeany) & (1UL << TAKE_ANY); // set take_any true
+    // Initialize recovery state (history window) at the shared index (only once)
+    struct seq_rcvy_and_hist new_rec = {};
+    new_rec.hist_recvseq_takeany ^= (-(true) ^ new_rec.hist_recvseq_takeany) & (1UL << TAKE_ANY);
     new_rec.no_encap = no_encap;
-    ret = bpf_map_update_elem(fds->seqrcvy_map, &cfg->match_id, &new_rec, BPF_ADD);
+    ret = bpf_map_update_elem(fds->seqrcvy_map, &rcvy_idx, &new_rec, BPF_ANY); // overrides the existing history window
     if (ret < 0) {
-        fprintf(stderr, "Failed to insert sequence recovery to elimination map. Maybe already exists?\n");
+        fprintf(stderr, "Failed to create history window\n");
         return -EINVAL;
     }
 
@@ -296,19 +337,20 @@ static int configure_elimination(struct skel_fds *fds, struct config_item *cfg)
 static int config_progs(struct skel_fds *fds)
 {
     int ret = EXIT_SUCCESS;
+    int rcvy_idx = next_rcvy_idx;
 
     for (unsigned int i = 0; i < cfg_size; ++i) {
         struct config_item *frer_func = &global_config[i];
-        if (frer_func->mode == FRER_REPL || frer_func->mode == PREOF_REPL) {
+        if (frer_func->mode == FRER_REPL || frer_func->mode == PREF_REPL) {
             ret = configure_replication(fds, frer_func);
             if (ret < 0) {
-                fprintf(stderr, "Failed to configure replication (ID %d)\n", frer_func->match_id);
+                fprintf(stderr, "Failed to configure replication (ID %ld)\n", get_map_key(frer_func));
                 return ret;
             }
-        } else if (frer_func->mode == FRER_ELIM || frer_func->mode == PREOF_ELIM) {
-            ret = configure_elimination(fds, frer_func);
+        } else if (frer_func->mode == FRER_ELIM || frer_func->mode == PREF_ELIM) {
+            ret = configure_elimination(fds, frer_func, rcvy_idx);
             if (ret < 0) {
-                fprintf(stderr, "Failed to configure elimination (ID %d)\n", frer_func->match_id);
+                fprintf(stderr, "Failed to configure elimination (ID %ld)\n", get_map_key(frer_func));
                 return ret;
             }
         } else {
@@ -386,9 +428,9 @@ static int pin_prog(int prog_fd, const char *name)
  */
 static void unpin_maps(void)
 {
-    const char *names[] = { "seqgen_map", "replicate_tx_map", "seqrcvy_map",
-                            "eliminate_tx_map", "rvt", "evt", "dst_addr_map",
-                            "postprocessing_prog" };
+    const char *names[] = { "seqgen_map", "replicate_tx_map", "seqrcvy_idx_map",
+                            "seqrcvy_map", "eliminate_tx_map", "rvt", "evt",
+                            "dst_addr_map", "postprocessing_prog" };
     unsigned short names_size = sizeof(names)/sizeof(names[0]);
 
     for (unsigned short i = 0; i < names_size; i++) {
@@ -408,10 +450,10 @@ static void unpin_maps(void)
  * @param flow_label The flow label used as part of the map key.
  * @return 0 if successful, -EINVAL if any map update fails.
  */
-static int setup_ip_translation(int table_fd, struct egress_info *ifaces, int entries, int flow_label)
+static int setup_ip_translation(int table_fd, struct egress_info *ifaces, int entries, int64_t flow_label)
 {
     for (int i = 0; i < entries; ++i) {
-        struct tx_key k = { .ifidx = ifaces[i].ifidx, .flow_label = flow_label };
+        struct tx_key k = { .ifidx = ifaces[i].ifidx, .match_id = flow_label };
         int ret = bpf_map_update_elem(table_fd, &k, &ifaces[i].dst_addr, 0);
         if (ret < 0) {
             fprintf(stderr, "Failed to insert IP for %s into dst_addr_map\n", ifaces[i].ifname);
@@ -478,10 +520,14 @@ static int setup_vlan_translation(int table_fd, struct vlan_translation_table *t
  */
 static void fill_config_tables(void)
 {
-    if (mode == FRER_REPL || mode == PREOF_REPL) {
+    if (mode == FRER_REPL || mode == PREF_REPL) {
         struct config_item cfg_item = {};
         strcpy(cfg_item.rx_ifname, ingress_ifaces[0].ifname);
-        cfg_item.match_id = (mode == PREOF_REPL) ? ingress_ifaces[0].flow_id : ingress_ifaces[0].vid;
+        if (mode == PREF_REPL) {
+            cfg_item.pmatch = ingress_ifaces[0].pmatch;
+        } else {
+            cfg_item.vid = ingress_ifaces[0].vid;
+        }
         cfg_item.mode = mode;
         cfg_item.num_tx_ifaces = egress_size;
         cfg_item.prog_fd = 0;
@@ -504,7 +550,11 @@ static void fill_config_tables(void)
         for (unsigned int i = 0; i < ingress_size; i++) {
             struct config_item cfg_item = {};
             strcpy(cfg_item.rx_ifname, ingress_ifaces[i].ifname);
-            cfg_item.match_id = (mode == PREOF_ELIM) ? ingress_ifaces[i].flow_id : egress_ifaces[0].vid;
+            if (mode == PREF_ELIM) {
+                cfg_item.pmatch = ingress_ifaces[i].pmatch;
+            } else {
+                cfg_item.vid = egress_ifaces[0].vid;
+            }
             cfg_item.mode = mode;
             cfg_item.num_tx_ifaces = 1;
             cfg_item.prog_fd = 0;
@@ -521,6 +571,24 @@ static void fill_config_tables(void)
             }
         }
     }
+}
+
+/**
+ * @brief Parse a string as a number with validation.
+ * @param str The string to parse.
+ * @param base The numeric base (10 for decimal, 16 for hex).
+ * @param max Maximum allowed value.
+ * @param result Pointer to store the parsed value.
+ * @return 0 on success, -1 on failure.
+ */
+static int parse_number(const char *str, int base, long max, long *result)
+{
+    char *endptr;
+    long val = strtol(str, &endptr, base);
+    if (*endptr != '\0' || endptr == str || val < 0 || val > max)
+        return -1;
+    *result = val;
+    return 0;
 }
 
 /**
@@ -576,9 +644,9 @@ static int parse_opt(int key, char *arg, struct argp_state *state) {
             } else if (strcmp("elim", arg) == 0) {
                 mode = FRER_ELIM;
             } else if (strcmp("prf", arg) == 0) {
-                mode = PREOF_REPL;
+                mode = PREF_REPL;
             } else if (strcmp("pef", arg) == 0) {
-                mode = PREOF_ELIM;
+                mode = PREF_ELIM;
             } else {
                 fprintf(stderr, "There is no '%s' mode!\n", arg);
                 exit(EXIT_FAILURE);
@@ -591,7 +659,7 @@ static int parse_opt(int key, char *arg, struct argp_state *state) {
                 exit(EXIT_FAILURE);
             }
 
-            if ((mode == FRER_REPL || mode == PREOF_REPL) && ingress_size >= 1) {
+            if ((mode == FRER_REPL || mode == PREF_REPL) && ingress_size >= 1) {
                 fprintf(stderr, "Only one ingress interface can be in replication mode!\n");
                 exit(EXIT_FAILURE);
             }
@@ -612,17 +680,61 @@ static int parse_opt(int key, char *arg, struct argp_state *state) {
             if (token == NULL) {
                 if (mode == FRER_REPL)
                     fprintf(stderr, "Missing VID for ingress interface. Use IFNAME:VID (e.g. eth0:10)\n");
-                else if (mode == PREOF_REPL)
-                    fprintf(stderr, "Missing Flow ID for ingress interface. Use IFNAME:FLOW_ID (e.g. eth0:10)\n");
+                else if (mode == PREF_REPL || mode == PREF_ELIM)
+                    fprintf(stderr, "Missing match type. Use IFNAME:fl:FLOW_LABEL or IFNAME:rsid:FUNCT:FLOW_ID\n");
                 else
                     fprintf(stderr, "Wrong format for ingress interface. Use IFNAME:NUM (e.g. eth0:10)\n");
                 exit(EXIT_FAILURE);
             }
 
-            if (mode == PREOF_REPL || mode == PREOF_ELIM)
-                ingress_ifaces[ingress_size].flow_id = atoi(token);
-            else
+            if (mode == PREF_REPL || mode == PREF_ELIM) {
+                if (strcmp(token, "fl") == 0) {
+                    token = strtok(NULL, ":");
+                    if (token == NULL) {
+                        fprintf(stderr, "Missing flow label value. Use IFNAME:fl:FLOW_LABEL\n");
+                        exit(EXIT_FAILURE);
+                    }
+                    long val;
+                    if (parse_number(token, 10, 0xFFFFF, &val) < 0) {
+                        fprintf(stderr, "Invalid flow label '%s'. Must be a decimal number (0-%d).\n", token, 0xFFFFF);
+                        exit(EXIT_FAILURE);
+                    }
+                    ingress_ifaces[ingress_size].pmatch.mtype = MATCH_FL;
+                    ingress_ifaces[ingress_size].pmatch.funct = 0;
+                    ingress_ifaces[ingress_size].pmatch.flow_id = (uint32_t)val;
+                } else if (strcmp(token, "rsid") == 0) {
+                    token = strtok(NULL, ":");
+                    if (token == NULL) {
+                        fprintf(stderr, "Missing function value. Use IFNAME:rsid:FUNCT:FLOW_ID\n");
+                        exit(EXIT_FAILURE);
+                    }
+                    long fval;
+                    if (parse_number(token, 16, 0xFFFF, &fval) < 0) {
+                        fprintf(stderr, "Invalid function '%s'. Must be hex (0-FFFF).\n", token);
+                        exit(EXIT_FAILURE);
+                    }
+
+                    token = strtok(NULL, ":");
+                    if (token == NULL) {
+                        fprintf(stderr, "Missing flow_id value. Use IFNAME:rsid:FUNCT:FLOW_ID\n");
+                        exit(EXIT_FAILURE);
+                    }
+                    long fidval;
+                    if (parse_number(token, 16, 0xFFFFF, &fidval) < 0) {
+                        fprintf(stderr, "Invalid flow_id '%s'. Must be hex (0-FFFFF).\n", token);
+                        exit(EXIT_FAILURE);
+                    }
+
+                    ingress_ifaces[ingress_size].pmatch.mtype = MATCH_RSID;
+                    ingress_ifaces[ingress_size].pmatch.funct = (uint16_t)fval;
+                    ingress_ifaces[ingress_size].pmatch.flow_id = (uint32_t)fidval;
+                } else {
+                    fprintf(stderr, "Unknown match type '%s'. Use 'fl' or 'rsid'\n", token);
+                    exit(EXIT_FAILURE);
+                }
+            } else {
                 ingress_ifaces[ingress_size].vid = atoi(token);
+            }
             ingress_size++;
             break;
         case 'e':
@@ -631,7 +743,7 @@ static int parse_opt(int key, char *arg, struct argp_state *state) {
                 exit(EXIT_FAILURE);
             }
 
-            if ((mode == FRER_ELIM || mode == PREOF_ELIM) && egress_size >= 1) {
+            if ((mode == FRER_ELIM || mode == PREF_ELIM) && egress_size >= 1) {
                 fprintf(stderr, "Only one egress interface can be in elimination mode!\n");
                 exit(EXIT_FAILURE);
             }
@@ -651,7 +763,7 @@ static int parse_opt(int key, char *arg, struct argp_state *state) {
                 exit(EXIT_FAILURE);
             }
 
-            if (mode == PREOF_ELIM || mode == PREOF_REPL) {
+            if (mode == PREF_ELIM || mode == PREF_REPL) {
                 if (inet_pton(AF_INET6, token, &egress_ifaces[egress_size].dst_addr) != 1) {
                     fprintf(stderr, "Invalid IPv6 address '%s'\n", token);
                     exit(EXIT_FAILURE);
@@ -686,7 +798,7 @@ static int parse_opt(int key, char *arg, struct argp_state *state) {
 int main(int argc, char* argv[])
 {
     struct xdpfrer_bpf *frer_skel = NULL;
-    struct xdppreof_bpf *preof_skel = NULL;
+    struct xdppref_bpf *pref_skel = NULL;
     struct skel_fds fds = {};
     volatile int *bss_received = NULL;
     volatile int *bss_passed = NULL;
@@ -700,13 +812,13 @@ int main(int argc, char* argv[])
     struct argp_option options[] =
     {
         { 0, 0, 0, 0, "Required options:", 1},
-        { "mode", 'm', "WORD", 0, "Mode: repl/elim (FRER) or prf/pef (PREOF).", 1},
-        { "ingress", 'i', "WORD", 0, "Ingress interface in IFNAME:VID (FRER) or IFNAME:FLOW_ID (PREOF) format.", 1},
-        { "egress", 'e', "WORD", 0, "Egress interface in IFNAME:VID (FRER) or IFNAME:ADDR (PREOF) format.", 1},
+        { "mode", 'm', "WORD", 0, "Mode: repl/elim (FRER) or prf/pef (PREF).", 1},
+        { "ingress", 'i', "WORD", 0, "Ingress interface in IFNAME:VID (FRER) or IFNAME:fl:FLOW_LABEL or IFNAME:rsid:FUNCT:FLOW_ID (PREF) format.", 1},
+        { "egress", 'e', "WORD", 0, "Egress interface in IFNAME:VID (FRER) or IFNAME:ADDR (PREF) format.", 1},
         { 0, 0, 0, 0, "Optional:", 2},
-        { "dmac", 'd', "MAC", 0, "Destination MAC address for PREOF mode (XX:XX:XX:XX:XX:XX). " \
+        { "dmac", 'd', "MAC", 0, "Destination MAC address for PREF mode (XX:XX:XX:XX:XX:XX). " \
           "Default value is 02:00:00:00:00:01.", 2},
-        { "not", 'n', 0, 0, "Don't add/remove R-tag (FRER) or don't encapsulate/decapsulate (PREOF).", 2},
+        { "not", 'n', 0, 0, "Don't add/remove R-tag (FRER) or don't encapsulate/decapsulate (PREF).", 2},
         { "quiet", 'q', 0, 0, "Quiet output.", 2},
         { "help", 'h', 0, 0, "Show this help message.", 3},
         { 0 }
@@ -728,6 +840,7 @@ int main(int argc, char* argv[])
         }
         fds.seqgen_map = bpf_map__fd(frer_skel->maps.seqgen_map);
         fds.replicate_tx_map = bpf_map__fd(frer_skel->maps.replicate_tx_map);
+        fds.seqrcvy_idx_map = bpf_map__fd(frer_skel->maps.seqrcvy_idx_map);
         fds.seqrcvy_map = bpf_map__fd(frer_skel->maps.seqrcvy_map);
         fds.eliminate_tx_map = bpf_map__fd(frer_skel->maps.eliminate_tx_map);
         fds.dst_addr_map = -1;
@@ -744,30 +857,31 @@ int main(int argc, char* argv[])
         bss_unmatched = &frer_skel->bss->unmatched;
 
     } else {
-        preof_skel = xdppreof_bpf__open_and_load();
-        if (!preof_skel) {
-            perror("Error while open and load PREOF skeleton");
+        pref_skel = xdppref_bpf__open_and_load();
+        if (!pref_skel) {
+            perror("Error while open and load PREF skeleton");
             ret = EXIT_FAILURE;
             goto end;
         }
-        __builtin_memcpy(preof_skel->data->dst_mac, dst_mac, 6);
+        __builtin_memcpy(pref_skel->data->dst_mac, dst_mac, 6);
 
-        fds.seqgen_map = bpf_map__fd(preof_skel->maps.seqgen_map);
-        fds.replicate_tx_map = bpf_map__fd(preof_skel->maps.replicate_tx_map);
-        fds.seqrcvy_map = bpf_map__fd(preof_skel->maps.seqrcvy_map);
-        fds.eliminate_tx_map = bpf_map__fd(preof_skel->maps.eliminate_tx_map);
-        fds.dst_addr_map = bpf_map__fd(preof_skel->maps.dst_addr_map);
+        fds.seqgen_map = bpf_map__fd(pref_skel->maps.seqgen_map);
+        fds.replicate_tx_map = bpf_map__fd(pref_skel->maps.replicate_tx_map);
+        fds.seqrcvy_idx_map = bpf_map__fd(pref_skel->maps.seqrcvy_idx_map);
+        fds.seqrcvy_map = bpf_map__fd(pref_skel->maps.seqrcvy_map);
+        fds.eliminate_tx_map = bpf_map__fd(pref_skel->maps.eliminate_tx_map);
+        fds.dst_addr_map = bpf_map__fd(pref_skel->maps.dst_addr_map);
         fds.rvt_map = -1;
         fds.evt_map = -1;
-        fds.replicate_prog = bpf_program__fd(preof_skel->progs.replicate);
-        fds.eliminate_prog = bpf_program__fd(preof_skel->progs.eliminate);
-        fds.postprocessing_prog = bpf_program__fd(preof_skel->progs.replicate_postprocessing);
-        fds.check_reset_prog = bpf_program__fd(preof_skel->progs.check_reset);
+        fds.replicate_prog = bpf_program__fd(pref_skel->progs.replicate);
+        fds.eliminate_prog = bpf_program__fd(pref_skel->progs.eliminate);
+        fds.postprocessing_prog = bpf_program__fd(pref_skel->progs.replicate_postprocessing);
+        fds.check_reset_prog = bpf_program__fd(pref_skel->progs.check_reset);
 
-        bss_received = &preof_skel->bss->received;
-        bss_passed = &preof_skel->bss->passed;
-        bss_dropped = &preof_skel->bss->dropped;
-        bss_unmatched = &preof_skel->bss->unmatched;
+        bss_received = &pref_skel->bss->received;
+        bss_passed = &pref_skel->bss->passed;
+        bss_dropped = &pref_skel->bss->dropped;
+        bss_unmatched = &pref_skel->bss->unmatched;
 
         // Pinning maps
         if (mkdir(PIN_DIR, 0700) && errno != EEXIST) {
@@ -776,11 +890,12 @@ int main(int argc, char* argv[])
             goto end;
         }
 
-        pin_map(preof_skel->maps.seqgen_map, "seqgen_map");
-        pin_map(preof_skel->maps.replicate_tx_map, "replicate_tx_map");
-        pin_map(preof_skel->maps.seqrcvy_map, "seqrcvy_map");
-        pin_map(preof_skel->maps.eliminate_tx_map, "eliminate_tx_map");
-        pin_map(preof_skel->maps.dst_addr_map, "dst_addr_map");
+        pin_map(pref_skel->maps.seqgen_map, "seqgen_map");
+        pin_map(pref_skel->maps.replicate_tx_map, "replicate_tx_map");
+        pin_map(pref_skel->maps.seqrcvy_idx_map, "seqrcvy_idx_map");
+        pin_map(pref_skel->maps.seqrcvy_map, "seqrcvy_map");
+        pin_map(pref_skel->maps.eliminate_tx_map, "eliminate_tx_map");
+        pin_map(pref_skel->maps.dst_addr_map, "dst_addr_map");
         pin_prog(fds.postprocessing_prog, "postprocessing_prog");
     }
 
@@ -797,15 +912,19 @@ int main(int argc, char* argv[])
         if (ret < 0)
             goto end;
     } else {
-        if (mode == PREOF_REPL) {
-            ret = setup_ip_translation(fds.dst_addr_map, egress_ifaces, egress_size, ingress_ifaces[0].flow_id);
+        if (mode == PREF_REPL) {
+            int64_t key = get_map_key(&global_config[0]);
+            ret = setup_ip_translation(fds.dst_addr_map, egress_ifaces, egress_size, key);
             if (ret < 0)
                 goto end;
         }
-        if (mode == PREOF_ELIM && no_encap) {
-            ret = setup_ip_translation(fds.dst_addr_map, egress_ifaces, egress_size, ingress_ifaces[0].flow_id);
-            if (ret < 0)
-                goto end;
+        if (mode == PREF_ELIM && no_encap) {
+            for (unsigned int i = 0; i < cfg_size; i++) {
+                int64_t k = get_map_key(&global_config[i]);
+                ret = setup_ip_translation(fds.dst_addr_map, egress_ifaces, egress_size, k);
+                if (ret < 0)
+                    goto end;
+            }
         }
     }
 
@@ -821,11 +940,11 @@ int main(int argc, char* argv[])
         if (!quiet_output) {
             if (mode == FRER_REPL)
                 printf("Received: %d\n", *bss_received);
-            else if (mode == PREOF_REPL)
+            else if (mode == PREF_REPL)
                 printf("Received: %d, Unmatched: %d\n", *bss_received, *bss_unmatched);
             else if (mode == FRER_ELIM)
                 printf("Passed: %d, Dropped: %d\n", *bss_passed, *bss_dropped);
-            else if (mode == PREOF_ELIM)
+            else if (mode == PREF_ELIM)
                 printf("Passed: %d, Dropped: %d, Unmatched: %d\n", *bss_passed, *bss_dropped, *bss_unmatched);
         }
 
@@ -851,11 +970,11 @@ int main(int argc, char* argv[])
 end:
     printf("Exiting...\n");
     cleanup();
-    if (preof_skel)
+    if (pref_skel)
         unpin_maps();
     if (frer_skel)
         xdpfrer_bpf__destroy(frer_skel);
-    if (preof_skel)
-        xdppreof_bpf__destroy(preof_skel);
+    if (pref_skel)
+        xdppref_bpf__destroy(pref_skel);
     return ret;
 }

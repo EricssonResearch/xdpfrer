@@ -179,7 +179,7 @@ int replicate(struct xdp_md *pkt)
     if (data + ethhdr_sz + vlanhdr_sz > data_end)
         return XDP_DROP;
 
-    int vid = get_vlan_id(pkt);
+    int64_t vid = get_vlan_id(pkt);
     if (vid < 0)
         return XDP_DROP;
 
@@ -225,11 +225,15 @@ int eliminate(struct xdp_md *pkt)
     if (ret < 0)
         goto drop;
 
-    int vid = get_vlan_id(pkt);
+    int64_t vid = get_vlan_id(pkt);
     if (vid < 0)
         goto drop;
 
-    struct seq_rcvy_and_hist *rec = bpf_map_lookup_elem(&seqrcvy_map, &vid);
+    int *rcvy_idx = bpf_map_lookup_elem(&seqrcvy_idx_map, &vid);
+    if (!rcvy_idx)
+        goto drop;
+
+    struct seq_rcvy_and_hist *rec = bpf_map_lookup_elem(&seqrcvy_map, rcvy_idx);
     if (!rec)
         goto drop;
 

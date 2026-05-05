@@ -2,15 +2,13 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
-struct preof_sid {
+struct pref_sid {
     uint64_t loc;           // 64 bits - Locator
     uint16_t funct;         // 16 bits - Function
-    uint32_t flow_id : 20;  // 20 bits - Flow-ID
-    uint32_t seq : 16;      // 16 bits - Sequence Number
-    uint32_t reserved : 12; // 12 bits - padding (zeros)
+    uint8_t args[6];        // 48 bits: flow_id(20) | seq(16) | reserved(12), network byte order
 } __attribute__((packed));
 
-// PREOF destination address: (egress ifindex, flow label) -> IPv6 locator address
+// PREF destination address: (egress ifindex, match_id) -> IPv6 locator address
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 4096);
@@ -22,6 +20,42 @@ const size_t ethhdr_sz = sizeof(struct ethhdr);
 const size_t ipv6hdr_sz = sizeof(struct ipv6hdr);
 
 volatile unsigned char dst_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+
+/**
+ * @brief Extract the 20-bit flow ID from the PREF SID args field.
+ */
+static inline uint32_t get_pref_flow_id(const struct pref_sid *p)
+{
+    return ((uint32_t)p->args[0] << 12) | ((uint32_t)p->args[1] << 4) | (p->args[2] >> 4);
+}
+
+/**
+ * @brief Extract the 16-bit sequence number from the PREF SID args field.
+ */
+static inline uint16_t get_pref_seq(const struct pref_sid *p)
+{
+    return ((uint16_t)(p->args[2] & 0xF) << 12) | ((uint16_t)p->args[3] << 4) | (p->args[4] >> 4);
+}
+
+/**
+ * @brief Set the 20-bit flow ID in the PREF SID args field.
+ */
+static inline void set_pref_flow_id(struct pref_sid *p, uint32_t flow_id)
+{
+    p->args[0] = (flow_id >> 12) & 0xFF;
+    p->args[1] = (flow_id >> 4) & 0xFF;
+    p->args[2] = ((flow_id & 0xF) << 4) | (p->args[2] & 0x0F);
+}
+
+/**
+ * @brief Set the 16-bit sequence number in the PREF SID args field.
+ */
+static inline void set_pref_seq(struct pref_sid *p, uint16_t seq)
+{
+    p->args[2] = (p->args[2] & 0xF0) | ((seq >> 12) & 0xF);
+    p->args[3] = (seq >> 4) & 0xFF;
+    p->args[4] = ((seq & 0xF) << 4) | (p->args[4] & 0x0F);
+}
 
 /**
  * @brief Get the 20-bit flow label from the IPv6 header.
@@ -42,13 +76,14 @@ static int get_flow_label(const struct xdp_md *pkt)
 }
 
 /**
- * @brief Extract the flow ID and sequence number from the PREOF SID which is the outer IPv6 destination address.
+ * @brief Extract the flow ID and sequence number from the PREF SID which is the outer IPv6 destination address.
  * @param pkt The packet with headers.
  * @param flow_id Pointer to store the extracted 20-bit flow ID.
  * @param seq Pointer to store the extracted 16-bit sequence number.
+ * @param funct Pointer to store the extracted 16-bit function.
  * @return 0 if successful, -1 if the packet is too short.
  */
-static inline int read_preof_sid(struct xdp_md *pkt, uint32_t *flow_id, uint32_t *seq)
+static inline int read_pref_sid(struct xdp_md *pkt, uint32_t *flow_id, uint32_t *seq, uint16_t *funct)
 {
     void *data = (void *)(long) pkt->data;
     void *data_end = (void *)(long) pkt->data_end;
@@ -56,9 +91,10 @@ static inline int read_preof_sid(struct xdp_md *pkt, uint32_t *flow_id, uint32_t
         return -1;
 
     struct ipv6hdr *outer = data + ethhdr_sz;
-    struct preof_sid *psid = (struct preof_sid *)&outer->daddr;
-    *flow_id = psid->flow_id;
-    *seq = psid->seq;
+    struct pref_sid *psid = (struct pref_sid *)&outer->daddr;
+    *flow_id = get_pref_flow_id(psid);
+    *seq = get_pref_seq(psid);
+    *funct = bpf_ntohs(psid->funct);
 
     return 0;
 }
@@ -163,16 +199,16 @@ static inline int rm_outer_ipv6(struct xdp_md *pkt)
  * @brief Rewrite the outer IPv6 header. Rewrites the destination address with the address
  * from dst_addr_map and remove the SRH if present. Used when no_encap is set.
  * @param pkt The packet with headers.
- * @param flow_label The flow label used to look up the rewrite address.
+ * @param match_id The match ID (flow label or RSID) used to look up the rewrite address.
  * @return 0 if successful, -1 if the packet is too short or the address is not found.
  */
-static inline int rewrite_outer_ipv6(struct xdp_md *pkt, uint32_t flow_label)
+static inline int rewrite_outer_ipv6(struct xdp_md *pkt, int64_t match_id)
 {
-    int *tx_ifindex = bpf_map_lookup_elem(&eliminate_tx_map, &flow_label);
+    int *tx_ifindex = bpf_map_lookup_elem(&eliminate_tx_map, &match_id);
     if (!tx_ifindex)
         return -1;
 
-    struct tx_key k = { .ifidx = *tx_ifindex, .flow_label = flow_label };
+    struct tx_key k = { .ifidx = *tx_ifindex, .match_id = match_id };
     struct in6_addr *addr = bpf_map_lookup_elem(&dst_addr_map, &k);
     if (!addr)
         return -1;
@@ -186,10 +222,15 @@ static inline int rewrite_outer_ipv6(struct xdp_md *pkt, uint32_t flow_label)
         return -1;
 
     struct ipv6hdr *outer = data + ethhdr_sz;
-    struct preof_sid *psid = (struct preof_sid *)&outer->daddr;
-    struct preof_sid *src = (struct preof_sid *)addr;
+    struct pref_sid *psid = (struct pref_sid *)&outer->daddr;
+    struct pref_sid *src = (struct pref_sid *)addr;
     psid->loc = src->loc;
     psid->funct = src->funct;
+    
+    // Copy flow_id from configured address, preserve seq
+    uint16_t seq = get_pref_seq(psid);
+    __builtin_memcpy(psid->args, src->args, 6);
+    set_pref_seq(psid, seq);
 
     return 0;
 }
@@ -213,13 +254,13 @@ static inline int set_dst_mac(struct xdp_md *pkt)
 
 
 /**
- * @brief Add an outer IPv6 header with a PREOF SID between the Ethernet header and the
+ * @brief Add an outer IPv6 header with a PREF SID between the Ethernet header and the
  * original IPv6 header. The locator field is left empty for postprocessing to fill in.
  * Incoming: ETH | IPv6 | payload
  * Outgoing: ETH | outer IPv6 (nexthdr=41) | original IPv6 | payload
  * @param pkt The packet with headers.
  * @param flow_label The flow label from the original IPv6 header.
- * @param seq The sequence number to encode in the PREOF SID.
+ * @param seq The sequence number to encode in the PREF SID.
  * @return 0 if successful, -1 if the packet is invalid or there is no space for the header.
  */
 static inline int add_outer_ipv6(struct xdp_md *pkt, int flow_label, uint16_t seq)
@@ -258,12 +299,12 @@ static inline int add_outer_ipv6(struct xdp_md *pkt, int flow_label, uint16_t se
     outer->payload_len = bpf_htons(inner_total);
     outer->saddr = orig_saddr;
 
-    // Build PREOF SID as destination address
+    // Build PREF SID as destination address
     // psid->loc and psid->funct are set in postprocessing
-    struct preof_sid *psid = (struct preof_sid *)&outer->daddr;
-    psid->flow_id = flow_label;
-    psid->seq = seq;
-    psid->reserved = 0;
+    struct pref_sid *psid = (struct pref_sid *)&outer->daddr;
+    __builtin_memset(psid->args, 0, 6);
+    set_pref_flow_id(psid, flow_label);
+    set_pref_seq(psid, seq);
 
     return 0;
 }
@@ -276,8 +317,8 @@ int check_reset(char *dummy) // unused param to satisfy verifier
     return 1;
 }
 
-// PREOF replication: match IPv6 flow label, generate sequence number, add outer IPv6 with
-// PREOF SID, set destination MAC, broadcast to egress interfaces.
+// PREF replication: match IPv6 flow label or RSID, generate sequence number,
+// add outer IPv6 with PREF SID, set destination MAC, broadcast to egress interfaces.
 SEC("xdp")
 int replicate(struct xdp_md *pkt)
 {
@@ -292,18 +333,28 @@ int replicate(struct xdp_md *pkt)
         goto not_for_us;
     }
 
+    uint32_t flow_id;
+    uint32_t seq_dummy;
+    uint16_t funct;
+    int64_t match_id;
     int flow_label = get_flow_label(pkt);
-    if (flow_label < 0) {
-        bpf_printk("[Repl] flow_label is not set");
-        goto not_for_us;
+    struct seq_gen *gen = NULL;
+
+    // Try rsid match (combined funct+flow_id from PREF SID), then fl match (IPv6 flow label)
+    if (read_pref_sid(pkt, &flow_id, &seq_dummy, &funct) == 0) {
+        match_id = ((int64_t)funct << 20) | (flow_id & 0xFFFFF);
+        gen = bpf_map_lookup_elem(&seqgen_map, &match_id);
     }
-
-    bpf_printk("[Repl] flow_label: %d", flow_label);
-
-    struct seq_gen *gen = bpf_map_lookup_elem(&seqgen_map, &flow_label);
     if (!gen) {
-        bpf_printk("[Repl] seqgen_map lookup failed");
-        goto not_for_us;
+        if (flow_label < 0)
+            goto not_for_us;
+
+        match_id = flow_label;
+        gen = bpf_map_lookup_elem(&seqgen_map, &match_id);
+        if (!gen) {
+            bpf_printk("[Repl] seqgen_map lookup failed");
+            goto not_for_us;
+        }
     }
 
     // Packet matched our criteria, count it as received
@@ -311,7 +362,7 @@ int replicate(struct xdp_md *pkt)
 
     int ret = 0;
     if (gen->no_encap) {
-        // Remove the SRH but keep the outer IPv6 header with the PREOF SID (preserving flow_id and seq).
+        // Remove the SRH but keep the outer IPv6 header with the PREF SID (preserving flow_id and seq).
         // The destination locator and function are rewritten per egress interface in replicate_postprocessing.
         ret = rm_srh(pkt);
         if (ret < 0) {
@@ -322,14 +373,14 @@ int replicate(struct xdp_md *pkt)
         uint16_t seq = gen_seq(gen);
         bpf_printk("[Repl] generated seq %d", seq);
         
-        ret = add_outer_ipv6(pkt, flow_label, seq);
+        ret = add_outer_ipv6(pkt, flow_label, seq); // use flow_label because this is a plain packet
         if (ret < 0) {
             bpf_printk("[Repl] add_outer_ipv6 failed");
             goto drop;
         }
     }
 
-    struct tx_ifaces *tx = bpf_map_lookup_elem(&replicate_tx_map, &flow_label);
+    struct tx_ifaces *tx = bpf_map_lookup_elem(&replicate_tx_map, &match_id);
     if (!tx) {
         bpf_printk("[Repl] drop");
         goto drop;
@@ -342,7 +393,7 @@ int replicate(struct xdp_md *pkt)
     }
 
 pass:
-    bpf_printk("[Repl] pass");
+    bpf_printk("[Repl] redirect");
     return bpf_redirect_map(tx, 0, BPF_F_BROADCAST | BPF_F_EXCLUDE_INGRESS);
 not_for_us:
     __sync_fetch_and_add(&unmatched, 1); // prevent race condition when increment the counter
@@ -351,15 +402,32 @@ drop:
     return XDP_DROP;
 }
 
-// Per-egress devmap callback: fill in the locator portion of the PREOF SID from dst_addr_map.
+// Per-egress devmap callback: fill in the locator portion of the PREF SID from dst_addr_map.
 SEC("xdp/devmap")
 int replicate_postprocessing(struct xdp_md *pkt)
 {
-    struct tx_key k = { .ifidx = pkt->egress_ifindex, .flow_label = get_flow_label(pkt) };
-    bpf_printk("[Repl postprocessing] key: ifidx %d, fl %d", k.ifidx, k.flow_label);
+    // Compute the same key used by replicate: try rsid first, then fl
+    uint32_t flow_id;
+    uint32_t seq_dummy;
+    uint16_t funct;
+    int64_t match_id;
+
+    if (read_pref_sid(pkt, &flow_id, &seq_dummy, &funct) == 0) {
+        match_id = ((int64_t)funct << 20) | (flow_id & 0xFFFFF);
+    } else {
+        match_id = (int64_t)get_flow_label(pkt);
+    }
+
+    struct tx_key k = { .ifidx = pkt->egress_ifindex, .match_id = match_id };
     struct in6_addr *addr = bpf_map_lookup_elem(&dst_addr_map, &k);
-    if (!addr)
-        return XDP_PASS;
+    if (!addr) {
+        // Fallback to flow label match
+        match_id = (int64_t)get_flow_label(pkt);
+        k.match_id = match_id;
+        addr = bpf_map_lookup_elem(&dst_addr_map, &k);
+        if (!addr)
+            return XDP_PASS;
+    }
 
     void *data = (void *)(long)pkt->data;
     void *data_end = (void *)(long)pkt->data_end;
@@ -367,16 +435,22 @@ int replicate_postprocessing(struct xdp_md *pkt)
         return XDP_DROP;
 
     struct ipv6hdr *outer = data + ethhdr_sz;
-    struct preof_sid *psid = (struct preof_sid *)&outer->daddr;
-    struct preof_sid *src = (struct preof_sid *)addr;
+    struct pref_sid *psid = (struct pref_sid *)&outer->daddr;
+    struct pref_sid *src = (struct pref_sid *)addr;
     psid->loc = src->loc;
     psid->funct = src->funct;
+    
+    // Copy flow_id from the configured address (needed for SRv6 route matching),
+    // preserve the seq already set by add_outer_ipv6.
+    uint16_t seq = get_pref_seq(psid);
+    __builtin_memcpy(psid->args, src->args, 6);
+    set_pref_seq(psid, seq);
 
     bpf_printk("[Repl postprocessing] pass");
     return XDP_PASS;
 }
 
-// PREOF elimination: read PREOF SID, strip outer IPv6, run recovery algorithm, redirect or drop.
+// PREF elimination: read PREF SID, strip outer IPv6, run recovery algorithm, redirect or drop.
 SEC("xdp")
 int eliminate(struct xdp_md *pkt)
 {
@@ -387,24 +461,39 @@ int eliminate(struct xdp_md *pkt)
         goto not_for_us;
     }
 
-    uint32_t flow_label;
+    uint32_t flow_id;
     uint32_t seq;
-    int ret = read_preof_sid(pkt, &flow_label, &seq);
+    uint16_t funct;
+    int ret = read_pref_sid(pkt, &flow_id, &seq, &funct);
     if (ret < 0) {
-        bpf_printk("[Elim] Unable to read PREOF SID");
+        bpf_printk("[Elim] Unable to read PREF SID");
         goto not_for_us;
     }
 
-    bpf_printk("[Elim] flow_id: %d, seq: %d", flow_label, seq);
+    bpf_printk("[Elim] funct: %d flow_id: %d, seq: %d", funct, flow_id, seq);
 
-    struct seq_rcvy_and_hist *rec = bpf_map_lookup_elem(&seqrcvy_map, &flow_label);
+    // Try combined key (rsid mode) first, then flow_id only (fl mode)
+    int64_t match_id = ((int64_t)funct << 20) | (flow_id & 0xFFFFF);
+    int *rcvy_idx = bpf_map_lookup_elem(&seqrcvy_idx_map, &match_id);
+    if (!rcvy_idx) {
+        match_id = (int64_t)flow_id;
+        rcvy_idx = bpf_map_lookup_elem(&seqrcvy_idx_map, &match_id);
+        if (!rcvy_idx) {
+            bpf_printk("[Elim] drop wrong rsid or flow_id %d", flow_id);
+            goto not_for_us;
+        }
+    }
+
+    bpf_printk("[Elim] rcvy_idx for history window %d", rcvy_idx);
+
+    struct seq_rcvy_and_hist *rec = bpf_map_lookup_elem(&seqrcvy_map, rcvy_idx);
     if (!rec) {
-        bpf_printk("[Elim] drop wrong flow_label %d", flow_label);
+        bpf_printk("[Elim] No history window found for idx %d", *rcvy_idx);
         goto not_for_us;
     }
 
     if (rec->no_encap) {
-        ret = rewrite_outer_ipv6(pkt, flow_label);
+        ret = rewrite_outer_ipv6(pkt, match_id);
         if (ret < 0) {
             bpf_printk("[Elim] Unable to rewrite outer IPv6 destination");
             goto drop;
@@ -417,9 +506,9 @@ int eliminate(struct xdp_md *pkt)
         }
     }
 
-    int *tx_ifindex = bpf_map_lookup_elem(&eliminate_tx_map, &flow_label);
+    int *tx_ifindex = bpf_map_lookup_elem(&eliminate_tx_map, &match_id);
     if (!tx_ifindex) {
-        bpf_printk("[Elim] drop wrong flow_label %d", flow_label);
+        bpf_printk("[Elim] Drop, wrong key %ld for tx_map", match_id);
         goto drop;
     }
 

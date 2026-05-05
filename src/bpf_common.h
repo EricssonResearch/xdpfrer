@@ -14,15 +14,15 @@
                          ##__VA_ARGS__);                \
 })
 
-// Match ID (VLAN ID or flow label) -> sequence number generator
+// Match ID -> sequence number generator
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 8);
-    __uint(key_size, sizeof(int));
+    __uint(key_size, sizeof(int64_t));
     __uint(value_size, sizeof(struct seq_gen));
 } seqgen_map SEC(".maps");
 
-// Match ID (VLAN ID or flow label) -> replication TX interfaces (devmap)
+// Match ID -> replication TX interfaces (devmap)
 struct tx_ifaces { //helper for the verifier
     __uint(type, BPF_MAP_TYPE_DEVMAP_HASH);
     __uint(max_entries, 8);
@@ -34,13 +34,21 @@ struct tx_ifaces { //helper for the verifier
 struct {
     __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
     __uint(max_entries, 8);
-    __uint(key_size, sizeof(int));
+    __uint(key_size, sizeof(int64_t));
     __array(values, struct tx_ifaces);
 } replicate_tx_map SEC(".maps");
 
-// Match ID -> sequence recovery state
+// Match ID -> History window index (indirection for shared history window)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 64);
+    __uint(key_size, sizeof(int64_t));
+    __uint(value_size, sizeof(int));
+} seqrcvy_idx_map SEC(".maps");
+
+// History window index -> History window
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 8);
     __type(key, int);
     __type(value, struct seq_rcvy_and_hist);
@@ -50,7 +58,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 8);
-    __uint(key_size, sizeof(int));
+    __uint(key_size, sizeof(int64_t));
     __uint(value_size, sizeof(int));
 } eliminate_tx_map SEC(".maps");
 

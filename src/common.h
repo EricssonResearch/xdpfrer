@@ -27,7 +27,7 @@ struct vlan_translation_entry {
 // BPF map key for per-egress, per-flow lookups.
 struct tx_key {
     int ifidx;
-    int flow_label;
+    int64_t match_id; // flow_label or rsid
 };
 
 // Sequence recovery state and statistics, shared between BPF programs via seqrcvy_map.
