@@ -40,20 +40,27 @@ struct ingress_entry {
 static void usage(void)
 {
     fprintf(stderr,
-        "Usage:\n"
-        "  xdpfrer-ctl add -m repl -i IFNAME:VID -e IFNAME:VID [-e ...]\n"
-        "  xdpfrer-ctl add -m elim -i IFNAME:VID [-i ...] -e IFNAME:VID\n"
-        "  xdpfrer-ctl del -m repl -i IFNAME:VID\n"
-        "  xdpfrer-ctl del -m elim -i IFNAME:VID\n"
-        "  xdpfrer-ctl add -m prf -i IFNAME:fl:FLOW_LABEL -e IFNAME:ADDR [-e ...] [-n]\n"
-        "  xdpfrer-ctl add -m prf -i IFNAME:rsid:FUNCT:FLOW_ID -e IFNAME:ADDR [-e ...] [-n]\n"
-        "  xdpfrer-ctl add -m pef -i IFNAME:fl:FLOW_LABEL [-i ...] -e IFNAME:ADDR [-n]\n"
-        "  xdpfrer-ctl add -m pef -i IFNAME:rsid:FUNCT:FLOW_ID [-i ...] -e IFNAME:ADDR [-n]\n"
-        "  xdpfrer-ctl del -m prf -i IFNAME:fl:FLOW_LABEL\n"
-        "  xdpfrer-ctl del -m prf -i IFNAME:rsid:FUNCT:FLOW_ID\n"
-        "  xdpfrer-ctl del -m pef -i IFNAME:fl:FLOW_LABEL\n"
-        "  xdpfrer-ctl del -m pef -i IFNAME:rsid:FUNCT:FLOW_ID\n"
-        "  xdpfrer-ctl list\n");
+        "Usage: xdpfrer-ctl <command> [options]\n"
+        "\n"
+        "Commands:\n"
+        "  list                          List active flows\n"
+        "  add  -m <mode> -i ... -e ...  Add a flow\n"
+        "  del  -m <mode> -i ...         Delete a flow\n"
+        "\n"
+        "Modes: prf (replication), pef (elimination)\n"
+        "\n"
+        "Examples:\n"
+        "  xdpfrer-ctl add -m prf -i eth0:fl:10 -e veth0:5f00::1 [-e ...] [-n]\n"
+        "  xdpfrer-ctl add -m pef -i eth0:rsid:f:10110 [-i ...] -e veth0::: [-n]\n"
+        "  xdpfrer-ctl del -m prf -i eth0:fl:10\n"
+        "  xdpfrer-ctl del -m pef -i eth0:rsid:f:10110 [-i ...]\n"
+        "  xdpfrer-ctl list\n"
+        "\n"
+        "Options:\n"
+        "  -m <mode>   Mode: prf or pef\n"
+        "  -i <iface>  Ingress: IFNAME:fl:FLOW_LABEL or IFNAME:rsid:FUNCT:FLOW_ID\n"
+        "  -e <iface>  Egress: IFNAME:ADDR (IPv6 locator)\n"
+        "  -n          Don't encapsulate/decapsulate (rewrite outer header)\n");
 }
 
 /**
@@ -119,14 +126,16 @@ static int open_pinned(const char *name)
  */
 static int find_next_rcvy_idx(int idx_fd)
 {
-    int64_t key = 0, next;
+    int64_t key, next;
     int max_idx = -1;
-    while (bpf_map_get_next_key(idx_fd, &key, &next) == 0) {
-        int idx;
-        if (bpf_map_lookup_elem(idx_fd, &next, &idx) == 0 && idx > max_idx)
-            max_idx = idx;
+    if (bpf_map_get_next_key(idx_fd, NULL, &next) != 0)
+        return 0;
+    do {
         key = next;
-    }
+        int idx;
+        if (bpf_map_lookup_elem(idx_fd, &key, &idx) == 0 && idx > max_idx)
+            max_idx = idx;
+    } while (bpf_map_get_next_key(idx_fd, &key, &next) == 0);
     return max_idx + 1;
 }
 
@@ -409,12 +418,12 @@ static int print_seqrcvy_map(void)
         return 0;
 
     // Collect which indices are actually in use
-    bool used[8] = {};
+    bool used[MAX_FLOWS] = {};
     if (idx_fd >= 0) {
         int64_t key = 0, next;
         while (bpf_map_get_next_key(idx_fd, &key, &next) == 0) {
             int idx;
-            if (bpf_map_lookup_elem(idx_fd, &next, &idx) == 0 && idx >= 0 && idx < 8)
+            if (bpf_map_lookup_elem(idx_fd, &next, &idx) == 0 && idx >= 0 && idx < MAX_FLOWS)
                 used[idx] = true;
             key = next;
         }
@@ -422,7 +431,7 @@ static int print_seqrcvy_map(void)
     }
 
     bool has_entries = false;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < MAX_FLOWS; i++) {
         if (!used[i])
             continue;
         struct seq_rcvy_and_hist rec;

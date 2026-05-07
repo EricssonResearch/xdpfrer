@@ -17,7 +17,7 @@
 // Match ID -> sequence number generator
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 8);
+    __uint(max_entries, MAX_FLOWS);
     __uint(key_size, sizeof(int64_t));
     __uint(value_size, sizeof(struct seq_gen));
 } seqgen_map SEC(".maps");
@@ -33,7 +33,7 @@ struct tx_ifaces { //helper for the verifier
 // Match ID -> devmap of replication TX interfaces
 struct {
     __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
-    __uint(max_entries, 8);
+    __uint(max_entries, MAX_FLOWS);
     __uint(key_size, sizeof(int64_t));
     __array(values, struct tx_ifaces);
 } replicate_tx_map SEC(".maps");
@@ -41,7 +41,7 @@ struct {
 // Match ID -> History window index (indirection for shared history window)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 64);
+    __uint(max_entries, MAX_FLOWS);
     __uint(key_size, sizeof(int64_t));
     __uint(value_size, sizeof(int));
 } seqrcvy_idx_map SEC(".maps");
@@ -49,7 +49,7 @@ struct {
 // History window index -> History window
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 8);
+    __uint(max_entries, MAX_FLOWS);
     __type(key, int);
     __type(value, struct seq_rcvy_and_hist);
 } seqrcvy_map SEC(".maps");
@@ -57,7 +57,7 @@ struct {
 // Match ID -> elimination TX interface (ifindex)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 8);
+    __uint(max_entries, MAX_FLOWS);
     __uint(key_size, sizeof(int64_t));
     __uint(value_size, sizeof(int));
 } eliminate_tx_map SEC(".maps");

@@ -13,6 +13,7 @@ typedef uint64_t HST;
 #define FRER_RCVY_SEQ_SPACE (1 << 16) // 65536
 #define FRER_RECOVERY_TIMEOUT_NS ((1000*1000*1000)*2) // 2 seconds
 #define FRER_TIMEOUT_CHECK_PERIOD_NS ((1000*1000*1000) / 100) //every 10ms
+#define MAX_FLOWS 128
 
 #ifndef CLOCK_MONOTONIC
 #define CLOCK_MONOTONIC 1
