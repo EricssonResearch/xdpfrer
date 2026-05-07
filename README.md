@@ -32,6 +32,21 @@ Cite as:
 }
 ```
 
+## Table of Contents
+
+- [Requirements](#requirements)
+- [Building](#building)
+- [Argument list](#argument-list)
+- [Examples](#examples)
+- [Source](#source)
+- [Test environments and usage](#test-environments-and-usage)
+   - [FRER: veth-based environment](#frer-veth-based-environment)
+   - [PREF: basic veth-based environment](#pref-basic-veth-based-environment)
+   - [PREF: multiple replication](#pref-multiple-replication)
+   - [PREF: multiple elimination](#pref-multiple-elimination)
+- [Limitations](#limitations)
+- [Measurements](#measurements)
+
 ## Requirements
 
 Debian based GNU/Linux distribution is preferred.
@@ -438,7 +453,19 @@ The default path is path `3`.
 
    Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
 
-## Measurements:
+## Limitations
+
+- The history window size is 47 bits. Packets that arrive more than 47 sequence numbers after the last accepted one are treated as out-of-window and dropped.
+- The SRH (Segment Routing Header) can contain at most 6 SIDs. During elimination, the SRH must be removed, which requires knowing its exact size. Since the eBPF verifier does not allow computing the size dynamically, a fixed set of 
+allowed sizes is used. This could be increased by adding more switch cases.
+- The number of concurrent flows is limited to 128 (both sequence number generators and recovery instances). Increasing this requires changing the BPF map sizes.
+- Replication supports up to 8 egress interfaces per flow.
+- In PREF mode, a dedicated veth pair is required for each redundant path.
+- Each `xdpfrer` or `xdpfrer-ctl` command adds one flow at a time, as each invocation creates a single sequence number generator or history window.
+- `xdpfrer-ctl` only works in PREF mode.
+- XDP allows only one program per interface. If you attach replication on an interface, you can't also attach elimination on the same interface.
+
+## Measurements
 
 For advanced usage, take a look at the `test/measurement.py` script.
 It is possible to run XDP FRER/PREF on a real, physical testbed, just change the interface names and VLAN IDs and the script accordingly.
