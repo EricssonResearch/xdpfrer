@@ -240,7 +240,7 @@ static int cmd_add_pef(struct ingress_entry *ingress, int num_ingress,
     }
 
     struct seq_rcvy_and_hist rec = {};
-    rec.hist_recvseq_takeany = 1UL << TAKE_ANY;
+    rec.take_any = true;
     rec.no_encap = no_encap;
     bpf_map_update_elem(rcvy_fd, &rcvy_idx, &rec, BPF_ANY);
 

@@ -317,7 +317,7 @@ static int configure_elimination(struct skel_fds *fds, struct config_item *cfg, 
 
     // Initialize recovery state (history window) at the shared index (only once)
     struct seq_rcvy_and_hist new_rec = {};
-    new_rec.hist_recvseq_takeany ^= (-(true) ^ new_rec.hist_recvseq_takeany) & (1UL << TAKE_ANY);
+    new_rec.take_any = true;
     new_rec.no_encap = no_encap;
     ret = bpf_map_update_elem(fds->seqrcvy_map, &rcvy_idx, &new_rec, BPF_ANY); // overrides the existing history window
     if (ret < 0) {

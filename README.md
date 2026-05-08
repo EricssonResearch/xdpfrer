@@ -455,7 +455,7 @@ The default path is path `3`.
 
 ## Limitations
 
-- The history window size is 47 bits. Packets that arrive more than 47 sequence numbers after the last accepted one are treated as out-of-window and dropped.
+- The history window size is 64 bits. Packets that arrive more than 64 sequence numbers after the last accepted one are treated as out-of-window and dropped.
 - The SRH (Segment Routing Header) can contain at most 6 SIDs. During elimination, the SRH must be removed, which requires knowing its exact size. Since the eBPF verifier does not allow computing the size dynamically, a fixed set of 
 allowed sizes is used. This could be increased by adding more switch cases.
 - The number of concurrent flows is limited to 128 (both sequence number generators and recovery instances). Increasing this requires changing the BPF map sizes.

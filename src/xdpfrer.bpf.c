@@ -60,7 +60,7 @@ static int get_vlan_id(const struct xdp_md *pkt)
  * @param seq The sequence number that will appear in the R-tag.
  * @return 0 if successful, -1 if the packet is invalid or there is no space for the R-tag.
  */
-static inline int add_rtag(struct xdp_md *pkt, ushort *seq)
+static inline int add_rtag(struct xdp_md *pkt, uint16_t *seq)
 {
     // Make room for the R-tag at the beginning of the packet
     if (bpf_xdp_adjust_head(pkt, 0 - (int)rtaghdr_sz))
@@ -93,7 +93,7 @@ static inline int add_rtag(struct xdp_md *pkt, ushort *seq)
  * @param skip_remove Remove the R-tah or not.
  * @return 0 if successful, -1 if the packet is invalid or the R-tag removal failed.
  */
-static inline int rm_rtag(struct xdp_md *pkt, ushort *seq, bool skip_remove)
+static inline int rm_rtag(struct xdp_md *pkt, uint16_t *seq, bool skip_remove)
 {
     // Error bound check for the sake of the verifier
     void *data = (void *)(long) pkt->data;
@@ -237,7 +237,7 @@ int eliminate(struct xdp_md *pkt)
     if (!rec)
         goto drop;
 
-    ushort seq;
+    uint16_t seq;
     ret = rm_rtag(pkt, &seq, rec->no_encap);
     if (ret < 0)
         goto drop;

@@ -86,8 +86,7 @@ static inline short gen_seq(struct seq_gen *gen)
  * @brief (7.4.3.3 SequenceRecoveryReset)
  * SequenceRecoveryReset is called whenever the BEGIN event or the RECOVERY_TIMEOUT event occurs.
  * It resets the RecovSeqNum and SequenceHistory variables to their initial states, increments
- * frerCpsSeqRcvyResets, and sets TakeAny. Note that RecovSeqNum and SequenceHistory are reset only
- * if the VectorRecoveryAlgorithm is configured.
+ * frerCpsSeqRcvyResets, and sets TakeAny.
  * This function is a callback function in `bpf_for_each_map_elem` that means this function is going
  * to be called for every item in the bpf map.
  * @param map A bpf hashmap.
@@ -101,53 +100,18 @@ static inline short gen_seq(struct seq_gen *gen)
 static inline short sequence_recovery_reset(struct bpf_map *map, const void *key, void *value, void *ctx)
 {
     struct seq_rcvy_and_hist *rec = (struct seq_rcvy_and_hist *)value;
-    if (rec && ((rec->hist_recvseq_takeany >> TAKE_ANY) & 1LU) == true)
+    if (rec && rec->take_any)
         return 1;
 
     if (bpf_ktime_get_ns() - rec->last_packet_ns < FRER_RECOVERY_TIMEOUT_NS)
         return 1;
 
-    rec->hist_recvseq_takeany = 0; // reset the history window
-    rec->hist_recvseq_takeany ^= (-(true) ^ rec->hist_recvseq_takeany) & (1UL << TAKE_ANY); // set take_any to true
+    rec->history_window = 0;
+    rec->recv_seq = 0;
+    rec->take_any = true;
     rec->latent_error_resets += 1;
 
     return 0;
-}
-
-/**
- * @brief Extract a range of bits from the HST bit-packed variable.
- * @param value The 64-bit HST variable.
- * @param from The starting bit position (inclusive).
- * @param to The ending bit position (inclusive).
- * @return The extracted bits as an unsigned long.
- */
-static inline ulong bit_range(HST value, int from, int to) {
-    HST waste = sizeof(HST) * 8 - to - 1;
-    return (value << waste) >> (waste + from);
-}
-
-/**
- * @brief Set bits of the 64-bit variable that stores the RecovSeqNum, SequenceHistory, and TakeAny.
- * @param hst The 64-bit variable that stores the RecovSeqNum, SequenceHistory, and TakeAny.
- * @param history_window The SequenceHistory.
- * @param recv_seq The RecovSeqNum so-called sequence number.
- * @param take_any The TakeAny.
- * @param rec The sequence recovery struct that stores the SequenceHistory.
- */
-static inline void set_hst(HST hst, uint64_t history_window, ushort recv_seq, bool take_any, struct seq_rcvy_and_hist *rec)
-{
-    // Copy the history window into the hst
-    for (int i = 0; i < SEQ_START_BIT; i++)
-        hst ^= (-((history_window >> i) & 1LU) ^ hst) & (1UL << i);
-
-    // Copy the seqence number into the hst
-    for (int i = SEQ_START_BIT; i < TAKE_ANY; i++)
-        hst ^= ((-((recv_seq >> (i - SEQ_START_BIT)) & 1LU)) ^ hst) & (1UL << i);
-
-    // Set the take any
-    hst ^= (-(take_any) ^ hst) & (1UL << TAKE_ANY);
-
-    rec->hist_recvseq_takeany = hst;
 }
 
 /**
@@ -162,33 +126,29 @@ static inline void set_hst(HST hst, uint64_t history_window, ushort recv_seq, bo
  * @param seq The packet sequence number.
  * @return True if the packet is going to be accepted or false if the packet is going to be dropped.
  */
-static inline bool recover(struct seq_rcvy_and_hist *rec, ushort seq)
+static inline bool recover(struct seq_rcvy_and_hist *rec, uint16_t seq)
 {
-    HST hst = rec->hist_recvseq_takeany;
-    uint64_t history_window = bit_range(hst, 0, SEQ_START_BIT - 1);
-    bool take_any = (hst >> TAKE_ANY) & 1LU;
-    ushort recv_seq = bit_range(hst, SEQ_START_BIT, TAKE_ANY - 1);
-    int delta = calc_delta(seq, recv_seq);
+    int delta = calc_delta(seq, rec->recv_seq);
 
     // After the reset, accept the first incoming packet
-    if (take_any) {
-        history_window |= (1UL << (FRER_DEFAULT_HIST_LEN - 1)); // set the first bit to 1
-        take_any = false;
-        recv_seq = seq;
+    if (rec->take_any) {
+        rec->history_window |= (1ULL << (FRER_DEFAULT_HIST_LEN - 1)); // set the first bit to 1
+        rec->take_any = false;
+        rec->recv_seq = seq;
         rec->passed_packets += 1;
-        goto pass;
+        return true;
     } else if (delta >= FRER_DEFAULT_HIST_LEN || delta <= -FRER_DEFAULT_HIST_LEN) {
         rec->rogue_packets += 1;
         rec->discarded_packets += 1;
     } else if (delta <= 0) {
         if (-delta >= FRER_DEFAULT_HIST_LEN) // error check for the sake of the verifier
-            goto drop;
+            return false;
 
-        if (((history_window >> (FRER_DEFAULT_HIST_LEN - 1 + delta)) & 1LU) == 0) { // check bit for this seq
-            history_window |= (1UL << (FRER_DEFAULT_HIST_LEN - 1 + delta)); // set the bit
+        if (((rec->history_window >> (FRER_DEFAULT_HIST_LEN - 1 + delta)) & 1ULL) == 0) { // check bit for this seq
+            rec->history_window |= (1ULL << (FRER_DEFAULT_HIST_LEN - 1 + delta)); // set the bit
             rec->out_of_order_packets += 1;
             rec->passed_packets += 1;
-            goto pass;
+            return true;
         } else {
             rec->discarded_packets += 1;
         }
@@ -197,20 +157,14 @@ static inline bool recover(struct seq_rcvy_and_hist *rec, ushort seq)
         if (delta != 1) {
             rec->out_of_order_packets += 1;
         }
-        history_window = (history_window >> delta); // shift every bit to the right
-        history_window |= (1UL << (FRER_DEFAULT_HIST_LEN - 1)); // set the first bit to 1
-        recv_seq = seq;
+        rec->history_window = (rec->history_window >> delta); // shift every bit to the right
+        rec->history_window |= (1ULL << (FRER_DEFAULT_HIST_LEN - 1)); // set the first bit to 1
+        rec->recv_seq = seq;
         rec->passed_packets += 1;
-        goto pass;
+        return true;
     }
-    goto drop;
 
-drop:
-    set_hst(hst, history_window, recv_seq, take_any, rec);
     return false;
-pass:
-    set_hst(hst, history_window, recv_seq, take_any, rec);
-    return true;
 }
 
 #endif // _H_BPF_COMMON
