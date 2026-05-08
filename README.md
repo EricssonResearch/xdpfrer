@@ -66,13 +66,12 @@ make
 make install
 ```
 
-To build for aarch64, build the Docker image and run it.
+To build for aarch64, build the Docker image from the root folder and run it.
 The binary xdpfrer is presented in the /tmp folder.
 We can copy the binary file back to host filesystem from the running Docker container.
 
 ```
-docker build -f aarch64.Dockerfile -t xdpfrer .
-docker run -it --name xdpfrer xdpfrer /bin/bash
+docker build -f src/aarch64.Dockerfile -t xdpfrer .
 docker cp xdpfrer:/tmp/src/xdpfrer .
 ```
 
