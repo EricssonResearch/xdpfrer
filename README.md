@@ -232,6 +232,27 @@ On the replication side, `xdpfrer -m prf -i eth21:fl:10 -e veth0:5f00:0:0:8:f:10
 IPv6 packets with flow label 10 arriving on `eth21` are encapsulated with an outer IPv6 header carrying a Redundancy SID
 as the destination address and two replicas are sent out through `veth0` and `veth2`.
 
+Below is the Redundancy SID structure of the address from above `5f00:0:0:8:f:1011::` in its expanded form (`5f00:0000:0000:0008:000f:1011:0000:0000`):
+
+```
+┌────────────────────────┐ 5f00:0000:0000:0008: 000f: 1011:0 000:0 000 
+│    Locator (64 bit)    │           │            │     │      │    │  
+│  5f00:0000:0000:0008   ◀───────────┘            │     │      │    │  
+├────────────────────────┤                        │     │      │    │  
+│   Function (16 bit)    │                        │     │      │    │  
+│          000f          ◀────────────────────────┘     │      │    │  
+├────────────────────────┤                              │      │    │  
+│    Flow ID (20 bit)    │                              │      │    │  
+│         10110          ◀──────────────────────────────┘      │    │  
+├────────────────────────┤                                     │    │  
+│Sequence number (16 bit)│                                     │    │  
+│          0000          ◀─────────────────────────────────────┘    │  
+├────────────────────────┤                                          │  
+│   Reserved (12 bit)    │                                          │  
+│          000           ◀──────────────────────────────────────────┘  
+└────────────────────────┘                                             
+```
+
 The incoming packet:
 ```
 eth21:
@@ -244,7 +265,7 @@ eth21:
 ```
 
 After replication, packets look like this:
-(The Redundancy SID, used as the destination address, encodes the sequence number — so the address differs
+(The Redundancy SID encodes the sequence number — so the address differs
 from what was configured.)
 ```
 veth0:
@@ -262,6 +283,25 @@ veth2:
 │         │         dst         │                     │
 │         │5f00::8:f:2012:1:5000│    flow label 10    │
 └─────────┴─────────────────────┴─────────────────────┘
+```
+
+```
+┌────────────────────────┐ 5f00:0000:0000:0008: 000f: 1011:0 001:5 000 
+│    Locator (64 bit)    │           │            │     │      │    │  
+│  5f00:0000:0000:0008   ◀───────────┘            │     │      │    │  
+├────────────────────────┤                        │     │      │    │  
+│   Function (16 bit)    │                        │     │      │    │  
+│          000f          ◀────────────────────────┘     │      │    │  
+├────────────────────────┤                              │      │    │  
+│    Flow ID (20 bit)    │                              │      │    │  
+│         10110          ◀──────────────────────────────┘      │    │  
+├────────────────────────┤                                     │    │  
+│Sequence number (16 bit)│                                     │    │  
+│          0015          ◀─────────────────────────────────────┘    │  
+├────────────────────────┤                                          │  
+│   Reserved (12 bit)    │                                          │  
+│          000           ◀──────────────────────────────────────────┘  
+└────────────────────────┘                                             
 ```
 
 After reaching the Linux Network Stack on the other side of the veth pair:
