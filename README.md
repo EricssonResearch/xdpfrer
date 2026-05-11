@@ -32,6 +32,24 @@ Cite as:
 }
 ```
 
+## Table of Contents
+
+- [Requirements](#requirements)
+- [Source](#source)
+- [Building](#building)
+- [Argument list](#argument-list)
+- [Headers and Examples](#headers-and-examples)
+   - [FRER (Layer 2)](#frer-layer-2)
+   - [PREF (Layer 3)](#pref-layer-3)
+- [Test environments and usage](#test-environments-and-usage)
+   - [FRER: veth-based environment](#frer-veth-based-environment)
+   - [PREF: basic veth-based environment](#pref-basic-veth-based-environment)
+   - [PREF: multiple replication](#pref-multiple-replication)
+   - [PREF: multiple elimination](#pref-multiple-elimination)
+- [Limitations](#limitations)
+- [Wireshark Plugin](#wireshark-plugin)
+- [Measurements](#measurements)
+
 ## Requirements
 
 Debian based GNU/Linux distribution is preferred.
@@ -43,86 +61,6 @@ sudo apt install build-essential gcc-multilib clang llvm linux-tools-common bpft
 
 **Note: libbpf version must be at least 1.3.0 on Ubuntu 23.04.**
 
-## Building
-
-```
-cd src
-make
-make install
-```
-
-To build for aarch64, build the Docker image and run it.
-The binary xdpfrer is presented in the /tmp folder.
-We can copy the binary file back to host filesystem from the running Docker container.
-
-```
-docker build -f aarch64.Dockerfile -t xdpfrer .
-docker run -it --name xdpfrer xdpfrer /bin/bash
-docker cp xdpfrer:/tmp/src/xdpfrer .
-```
-
-## Argument list
-
-```
-Usage: xdpfrer [OPTION...]
-
- Required options:
-  -e, --egress=WORD          Egress interface in IFNAME:VID (FRER) or
-                             IFNAME:ADDR (PREOF) format.
-  -i, --ingress=WORD         Ingress interface in IFNAME:VID (FRER) or
-                             IFNAME:FLOW_ID (PREOF) format.
-  -m, --mode=WORD            Mode: repl/elim (FRER) or prf/pef (PREOF).
-
- Optional:
-  -d, --dmac=MAC             Destination MAC address for PREOF mode
-                             (XX:XX:XX:XX:XX:XX). Default value is
-                             02:00:00:00:00:01.
-  -n, --not                  Don't add or remove R-tag.
-  -q, --quiet                Quiet output.
-
-  -h, --help                 Show this help message.
-```
-
-__Important:__ 
-
-* In replication modes `repl` and `prf` one or more `--egress` and only one `--ingress` interface can be used
-* In elimination modes `elim` and `pef` one or more `--ingress` and only one `--egress` interface can be used
-* More replication and elimination instances can be added runtime with the `xdpfrer-ctl` helper tool.
-The format of the command line arguments are the same as the `xdpfrer` case.
-
-## Examples
-
-### FRER (Layer 2)
-
-`xdpfrer -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67` means:
-Packets with VLAN ID 20 arriving on `beth0` are replicated to `enp4s0` with VLAN ID 66 and `enp7s0` with VLAN ID 67.
-
-And `xdpfrer -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:20` means:
-Packets with VLAN ID 55 on `enp4s0` and VLAN ID 56 on `enp7s0` are received, duplicates are eliminated,
-and only the first copy is forwarded to `beth0` with VLAN ID 20.
-
-Using different VLAN IDs on the redundant paths is recommended.
-With that, per-VLAN STP instances can be used.
-Without that the egress interfaces of the redundant path(s) might be disabled by the STP,
-which would make the replication unreliable.
-
-### PREF (Layer 3)
-
-`xdpfrer -m prf -i ethBA:10 -e veth0:5f00:0:0:e:: -e veth0:5f00:0:0:e:: -d 02:00:00:00:00:01` means:
-IPv6 packets with flow label 10 arriving on `ethBA` are encapsulated with an outer IPv6 header carrying a Redundancy SID
-and two replicas are sent out through `veth0`, each with the same destination locator (`5f00:0:0:e::`).
-
-And `xdpfrer -m pef -i ethED:10 -e veth0::: -d 02:00:00:00:00:01` means:
-Encapsulated packets with flow ID 10 on `ethED` are decapsulated, duplicates are eliminated,
-and only the first instance is forwarded to `veth0` with destination MAC 02:00:00:00:00:01.
-
-In this implementation of the Layer 3 case the `xdpfrer` nodes should be the
-SRv6 tunnel endpoints.
-This achieved by configuring Linux with veth interfaces with MAC addresses and
-`xdpfrer` set the destination MAC addresses of the ingress packets (with matching flow labels) to that address.
-With that the node accept the packet for further Layer 3 processing e.g.: routing, SRv6 operations or
-perform ARP or ND if needed.
-
 ## Source
 
 ```
@@ -133,21 +71,298 @@ perform ARP or ND if needed.
 │   ├── bpf_common.h       // BPF map definitions and shared structures
 │   ├── common.h           // Shared data structures and defines
 │   ├── Makefile           // GNU make file
+│   ├── xdpfrer-ctl.c      // Runtime flow management tool for PREF mode
 │   ├── xdpfrer.bpf.c      // XDP programs for FRER (replication/elimination)
 │   ├── xdpfrer.c          // Configure and load the BPF part to the kernel
-│   └── xdppreof.bpf.c     // XDP programs for PREOF (SRv6-based)
+│   └── xdppref.bpf.c      // XDP programs for PREF (SRv6-based)
 └── test
-    ├── development
-    │   ├── srv6_test.py   // 6-node SRv6 PREF topology (Mininet)
-    │   ├── srv6_test.env  // 6-node SRv6 PREF topology (bash)
-    │   └── README.md      // Detailed SRv6 PREF internals
+    ├── pref_sid.lua       // Wireshark plugin for PREF SID
     ├── measurement.py     // All-in-one testing and plotting script
     ├── srv6.env           // 9-node SRv6 PREF topology (bash)
+    ├── srv6_multi_prf.env // 9-node SRv6 PREF topology with multiple replication (bash)
+    ├── srv6_multi_pef.env // 7-node SRv6 PREF topology with multiple elimination (bash)
     ├── physical.env       // FRER environment for physical testbed
     └── veth.env           // FRER environment using veth pairs and namespaces
 ```
 
-## Test environment:
+## Building
+
+```
+cd src
+make
+make install
+```
+
+To build for aarch64, build the Docker image from the root folder and run it.
+The binary xdpfrer is presented in the /tmp folder.
+We can copy the binary file back to host filesystem from the running Docker container.
+
+```
+docker build -f src/aarch64.Dockerfile -t xdpfrer .
+docker cp xdpfrer:/tmp/src/xdpfrer .
+```
+
+## Argument list
+
+```
+Usage: xdpfrer [OPTION...]
+
+ Required options:
+  -e, --egress=WORD          Egress interface in IFNAME:VID (FRER) or
+                             IFNAME:ADDR (PREF) format.
+  -i, --ingress=WORD         Ingress interface in IFNAME:VID (FRER) or
+                             IFNAME:fl:FLOW_LABEL or IFNAME:rsid:FUNCT:FLOW_ID
+                             (PREF) format.
+  -m, --mode=WORD            Mode: repl/elim (FRER) or prf/pef (PREF).
+
+ Optional:
+  -d, --dmac=MAC             Destination MAC address for PREF mode
+                             (XX:XX:XX:XX:XX:XX). Default value is
+                             02:00:00:00:00:01.
+  -n, --not                  Don't add/remove R-tag (FRER) or don't
+                             encapsulate/decapsulate (PREF).
+  -q, --quiet                Quiet output.
+
+  -h, --help                 Show this help message.
+```
+
+__Important:__ 
+
+* In replication modes `repl` and `prf` one or more `--egress` and only one `--ingress` interface can be used
+* In elimination modes `elim` and `pef` one or more `--ingress` and only one `--egress` interface can be used
+* More replication and elimination instances can be added runtime with the `xdpfrer-ctl` helper tool.
+The format of the command-line arguments are the same as the `xdpfrer` case.
+It only works for PREF modes (prf/pef).
+The code only pins BPF maps (to `/sys/fs/bpf/xdpfrer`) when running in PREF mode.
+This is why `xdpfrer-ctl` only works for PREF, it relies on pinned maps.
+
+## Headers and Examples
+
+This section describes the packet headers used in FRER and PREF modes,
+how they are modified during replication and elimination, and provides command-line examples for each mode.
+
+### FRER (Layer 2)
+
+In FRER mode, during replication, the incoming packet must have a VLAN tag — packets without one are dropped.
+An R-tag is inserted after the VLAN tag and copies are sent out on each given egress interface.
+During elimination, packets arrive with a VLAN tag and R-tag. The R-tag is removed and the VLAN ID is changed to
+the configured egress value.
+
+In the command-line arguments we can set which VLAN ID will be accepted on ingress and what VLAN ID will be
+set on the egress interface, both in replication and elimination.
+
+On the replication side, `xdpfrer -m repl -i beth0:20 -e enp4s0:66 -e enp7s0:67` means:
+Packets with VLAN ID 20 arriving on `beth0` are replicated to `enp4s0` with VLAN ID 66 and `enp7s0` with VLAN ID 67.
+
+For the command-line argument above, the incoming packet looks like this:
+```
+beth0:
+┌─────────┬──────────┬─────────────────┐
+│         │          │                 │
+│   ETH   │   VLAN   │       IP        │
+│         │  VID 20  │                 │
+└─────────┴──────────┴─────────────────┘
+```
+
+After the replication, packets look like this:
+```
+enp4s0:
+┌─────────┬──────────┬─────────┬─────────────────┐
+│         │          │         │                 │
+│   ETH   │   VLAN   │  R-TAG  │       IP        │
+│         │  VID 66  │  SEQ 1  │                 │
+└─────────┴──────────┴─────────┴─────────────────┘
+
+enp7s0:
+┌─────────┬──────────┬─────────┬─────────────────┐
+│         │          │         │                 │
+│   ETH   │   VLAN   │  R-TAG  │       IP        │
+│         │  VID 67  │  SEQ 1  │                 │
+└─────────┴──────────┴─────────┴─────────────────┘
+```
+
+On the elimination side, `xdpfrer -m elim -i enp4s0:55 -i enp7s0:56 -e beth0:10` means:
+Packets with VLAN ID 55 on `enp4s0` and VLAN ID 56 on `enp7s0` are received, duplicates are eliminated,
+and only the first copy is forwarded to `beth0` with VLAN ID 10.
+
+The incoming packets look like this:
+```
+enp4s0:
+┌─────────┬──────────┬─────────┬─────────────────┐
+│         │          │         │                 │
+│   ETH   │   VLAN   │  R-TAG  │       IP        │
+│         │  VID 55  │  SEQ 1  │                 │
+└─────────┴──────────┴─────────┴─────────────────┘
+
+enp7s0:
+┌─────────┬──────────┬─────────┬─────────────────┐
+│         │          │         │                 │
+│   ETH   │   VLAN   │  R-TAG  │       IP        │
+│         │  VID 56  │  SEQ 1  │                 │
+└─────────┴──────────┴─────────┴─────────────────┘
+```
+
+After the elimination, the R-tag is removed and the packet looks like this:
+```
+beth0:
+┌─────────┬──────────┬─────────────────┐
+│         │          │                 │
+│   ETH   │   VLAN   │       IP        │
+│         │  VID 10  │                 │
+└─────────┴──────────┴─────────────────┘
+```
+
+Using different VLAN IDs on the redundant paths is recommended.
+With that, per-VLAN STP instances can be used.
+Without that the egress interfaces of the redundant path(s) might be disabled by the STP,
+which would make the replication unreliable.
+
+### PREF (Layer 3)
+
+During replication, `xdpfrer` encapsulates and replicates incoming packets, then sends them to a veth interface.
+A postprocessing XDP program on the veth replaces the IPv6 destination address
+with the Redundancy SID, encoding the sequence number in the destination address.
+The packet then crosses to the other side of the veth pair, where it enters the Linux Network Stack.
+An SRv6 inline routing rule adds an SRH header, and Linux forwards the packet.
+For multiple redundant paths, multiple veth pairs are needed.
+
+On the replication side, `xdpfrer -m prf -i eth21:fl:10 -e veth0:5f00:0:0:8:f:1011:: -e veth2:5f00:0:0:8:f:2012::` means:
+IPv6 packets with flow label 10 arriving on `eth21` are encapsulated with an outer IPv6 header carrying a Redundancy SID
+as the destination address and two replicas are sent out through `veth0` and `veth2`.
+
+Below is the Redundancy SID structure of the address from above `5f00:0:0:8:f:1011::` in its expanded form (`5f00:0000:0000:0008:000f:1011:0000:0000`):
+
+```
+┌────────────────────────┐ 5f00:0000:0000:0008: 000f: 1011:0 000:0 000 
+│    Locator (64 bit)    │           │            │     │      │    │  
+│  5f00:0000:0000:0008   ◀───────────┘            │     │      │    │  
+├────────────────────────┤                        │     │      │    │  
+│   Function (16 bit)    │                        │     │      │    │  
+│          000f          ◀────────────────────────┘     │      │    │  
+├────────────────────────┤                              │      │    │  
+│    Flow ID (20 bit)    │                              │      │    │  
+│         10110          ◀──────────────────────────────┘      │    │  
+├────────────────────────┤                                     │    │  
+│Sequence number (16 bit)│                                     │    │  
+│          0000          ◀─────────────────────────────────────┘    │  
+├────────────────────────┤                                          │  
+│   Reserved (12 bit)    │                                          │  
+│          000           ◀──────────────────────────────────────────┘  
+└────────────────────────┘                                             
+```
+
+The incoming packet:
+```
+eth21:
+┌─────────┬───────────────────┐
+│   ETH   │        IPv6       │
+│         │     (original)    │
+│         │                   │
+│         │   flow label 10   │
+└─────────┴───────────────────┘
+```
+
+After replication, packets look like this:
+(The Redundancy SID encodes the sequence number — so the address differs
+from what was configured.)
+```
+veth0:
+┌─────────┬─────────────────────┬─────────────────────┐
+│   ETH   │        IPv6         │         IPv6        │
+│         │       (outer)       │      (original)     │
+│         │         dst         │                     │
+│         │5f00::8:f:1011:1:5000│    flow label 10    │
+└─────────┴─────────────────────┴─────────────────────┘
+
+veth2:
+┌─────────┬─────────────────────┬─────────────────────┐
+│   ETH   │        IPv6         │         IPv6        │
+│         │       (outer)       │      (original)     │
+│         │         dst         │                     │
+│         │5f00::8:f:2012:1:5000│    flow label 10    │
+└─────────┴─────────────────────┴─────────────────────┘
+```
+
+```
+┌────────────────────────┐ 5f00:0000:0000:0008: 000f: 1011:0 001:5 000 
+│    Locator (64 bit)    │           │            │     │      │    │  
+│  5f00:0000:0000:0008   ◀───────────┘            │     │      │    │  
+├────────────────────────┤                        │     │      │    │  
+│   Function (16 bit)    │                        │     │      │    │  
+│          000f          ◀────────────────────────┘     │      │    │  
+├────────────────────────┤                              │      │    │  
+│    Flow ID (20 bit)    │                              │      │    │  
+│         10110          ◀──────────────────────────────┘      │    │  
+├────────────────────────┤                                     │    │  
+│Sequence number (16 bit)│                                     │    │  
+│          0015          ◀─────────────────────────────────────┘    │  
+├────────────────────────┤                                          │  
+│   Reserved (12 bit)    │                                          │  
+│          000           ◀──────────────────────────────────────────┘  
+└────────────────────────┘                                             
+```
+
+After reaching the Linux Network Stack on the other side of the veth pair:
+```
+eth23 (egress interface):
+┌─────────┬─────────────────────┬───────────────────────────────┬─────────────────────┐
+│   ETH   │        IPv6         │              SRH              │         IPv6        │
+│         │       (outer)       ├────┬────┬─────────────────────┤      (original)     │
+│         │                     │sid1│... │    redundancy sid:  │                     │
+│         │      dst sid1       │    │    │5f00::8:f:1011:1:5000│    flow label 10    │
+└─────────┴─────────────────────┴────┴────┴─────────────────────┴─────────────────────┘
+
+eth24 (egress interface):
+┌─────────┬─────────────────────┬───────────────────────────────┬─────────────────────┐
+│   ETH   │        IPv6         │              SRH              │         IPv6        │
+│         │       (outer)       ├────┬────┬─────────────────────┤      (original)     │
+│         │                     │sid1│... │    redundancy sid:  │                     │
+│         │      dst sid1       │    │    │5f00::8:f:2012:1:5000│    flow label 10    │
+└─────────┴─────────────────────┴────┴────┴─────────────────────┴─────────────────────┘
+```
+
+On the elimination side, `xdpfrer -m pef -i eth84:rsid:f:10110 -i eth87:rsid:f:20120 -e veth0:::` means:
+Encapsulated packets with Redundancy SID `f:10110` on `eth84` and `f:20120` on `eth87` are decapsulated,
+duplicates are eliminated, and only the first instance is forwarded to `veth0`.
+
+The incoming packet:
+```
+eth84:
+┌─────────┬─────────────────────┬───────────────────────────────┬─────────────────────┐
+│   ETH   │        IPv6         │              SRH              │         IPv6        │
+│         │       (outer)       ├────┬────┬─────────────────────┤      (original)     │
+│         │                     │sid1│... │    redundancy sid:  │                     │
+│         │ dst redundancy sid  │    │    │5f00::8:f:1011:1:5000│    flow label 10    │
+└─────────┴─────────────────────┴────┴────┴─────────────────────┴─────────────────────┘
+
+eth87:
+┌─────────┬─────────────────────┬───────────────────────────────┬─────────────────────┐
+│   ETH   │        IPv6         │              SRH              │         IPv6        │
+│         │       (outer)       ├────┬────┬─────────────────────┤      (original)     │
+│         │                     │sid1│... │    redundancy sid:  │                     │
+│         │ dst redundancy sid  │    │    │5f00::8:f:2012:1:5000│    flow label 10    │
+└─────────┴─────────────────────┴────┴────┴─────────────────────┴─────────────────────┘
+```
+
+The outgoing packet after the elimination:
+```
+veth0:
+┌─────────┬───────────────────┐
+│   ETH   │        IPv6       │
+│         │     (original)    │
+│         │                   │
+│         │   flow label 10   │
+└─────────┴───────────────────┘
+```
+
+In this implementation of the Layer 3 case, the `xdpfrer` nodes should be the
+SRv6 tunnel endpoints.
+This is achieved by configuring Linux with veth interfaces with MAC addresses and
+`xdpfrer` sets the destination MAC addresses of the ingress packets (with matching flow labels) to that address.
+With that the node accepts the packet for further Layer 3 processing e.g., routing, SRv6 operations or
+performing ARP or ND if needed.
+
+## Test environments and usage
 
 ### FRER: veth-based environment
 
@@ -169,41 +384,6 @@ perform ARP or ND if needed.
                     │                                                   │                    
                     └───────────────────────────────────────────────────┘                    
 ```
-
-### PREF: veth-based environment
-
-`srv6.env` contains this 9-node topology with two redundant paths: `a` (n3-n4) and `b` (n5-n6-n7).
-`n2` replicates packets to both paths; `n8` eliminates duplicates. Normal (non-replicated) traffic is forwarded via path `a`.
-IPv6 loopback addresses follow the node name (e.g., `n3` has `5f00:0:0:3::`).
-Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `n2`–`n3` link.
-
-```
-                                         "a" path                                         
-                                                                                          
-                                5f00:0:0:3::  5f00:0:0:4::                                
-                                 ┌────────┐    ┌────────┐                                 
-                                 │        │    │        │                                 
-                            ┌────┤   n3   ├────┤   n4   ├────┐                            
-                            │    │        │    │        │    │                            
-                            │    └────────┘    └────────┘    │                            
-  ┌────────┐   ┌────────┐   │                                │    ┌────────┐   ┌────────┐ 
-  │        │   │        ├───┘                                └────┤        │   │        │ 
-  │   n1   ├───┤   n2   │                                         │   n8   ├───┤   n9   │ 
-  │        │   │   prf  ├─┐                                    ┌──┤   pef  │   │        │ 
-  └────────┘   └────────┘ │                                    │  └────────┘   └────────┘ 
-5f00:0:0:1::  5f00:0:0:2::│ ┌────────┐  ┌────────┐  ┌────────┐ │5f00:0:0:8::  5f00:0:0:9::
-                          │ │        │  │        │  │        │ │                          
-                          └─┤   n5   ├──┤   n6   ├──┤   n7   ├─┘                          
-                            │        │  │        │  │        │                            
-                            └────────┘  └────────┘  └────────┘                            
-                          5f00:0:0:5:: 5f00:0:0:6:: 5f00:0:0:7::                          
-                                                                                          
-                                         "b" path                                         
-```
-
-## Usage
-
-### FRER mode
 
 1. **Set up the test environment:**
 
@@ -249,7 +429,8 @@ Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `
    #  ...
 
    # Eliminator output:
-   #  Config recovery on iface enp4s0 (ifindex: 3) match id 20
+   #  Config recovery on iface enp4s0 (ifindex: 3) match id 20 rcvy_idx 0
+   #  Config recovery on iface enp7s0 (ifindex: 5) match id 20 rcvy_idx 0
    #  Passed: 1, Dropped: 1
    #  Passed: 2, Dropped: 2
    #  ...
@@ -259,7 +440,36 @@ Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `
 
    Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
 
-### PREF mode
+### PREF: basic veth-based environment
+
+`srv6.env` contains this 9-node topology with two redundant paths: `1` (n3-n4) and `2` (n5-n6-n7).
+`n2` replicates packets to both paths; `n8` eliminates duplicates. Normal (non-replicated) traffic is forwarded via path `1`.
+IPv6 loopback addresses follow the node name (e.g., `n3` has `5f00:0:0:3::`).
+Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `n2`–`n3` link.
+
+```
+                                         "1" path                                         
+                                                                                          
+                                5f00:0:0:3::  5f00:0:0:4::                                
+                                 ┌────────┐    ┌────────┐                                 
+                                 │        │    │        │                                 
+                            ┌────┤   n3   ├────┤   n4   ├────┐                            
+                            │    │        │    │        │    │                            
+                            │    └────────┘    └────────┘    │                            
+  ┌────────┐   ┌────────┐   │                                │    ┌────────┐   ┌────────┐ 
+  │        │   │        ├───┘                                └────┤        │   │        │ 
+  │   n1   ├───┤   n2   │                                         │   n8   ├───┤   n9   │ 
+  │        │   │   prf  ├─┐                                    ┌──┤   pef  │   │        │ 
+  └────────┘   └────────┘ │                                    │  └────────┘   └────────┘ 
+5f00:0:0:1::  5f00:0:0:2::│ ┌────────┐  ┌────────┐  ┌────────┐ │5f00:0:0:8::  5f00:0:0:9::
+                          │ │        │  │        │  │        │ │                          
+                          └─┤   n5   ├──┤   n6   ├──┤   n7   ├─┘                          
+                            │        │  │        │  │        │                            
+                            └────────┘  └────────┘  └────────┘                            
+                          5f00:0:0:5:: 5f00:0:0:6:: 5f00:0:0:7::                          
+                                                                                          
+                                         "2" path                                         
+```
 
 1. **Start the environment:**
 
@@ -276,8 +486,8 @@ Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `
    Configure `n2` for replication and `n8` for elimination:
 
    ```
-   n2 xdpfrer -m prf -i eth21:10 -e veth0:5f00:0:0:8:a:: -e veth2:5f00:0:0:8:b:: -d 02:00:00:00:00:01
-   n8 xdpfrer -m pef -i eth84:10 -i eth87:10 -e veth0::: -d 02:00:00:00:00:01
+   n2 xdpfrer -m prf -i eth21:fl:10 -e veth0:5f00:0:0:8:f:1011:: -e veth2:5f00:0:0:8:f:2012:: -d 02:00:00:00:00:01
+   n8 xdpfrer -m pef -i eth84:rsid:f:10110 -i eth87:rsid:f:20120 -e veth0::: -d 02:00:00:00:00:01
    ```
 
 3. **Test connectivity:**
@@ -298,23 +508,176 @@ Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `
    n2 xdpfrer-ctl list
    ```
 
-   **Add a new flow** — for example, replicating a second flow (flow ID 11) on `n2` and eliminating it on `n8`:
+   **Add a new flow** — for example, replicating a second flow (flow ID 20) on `n2` and eliminating it on `n8`:
    ```
-   n2 xdpfrer-ctl add -m prf -i eth21:11 -e veth0:5f00:0:0:8:a:: -e veth2:5f00:0:0:8:b::
-   n8 xdpfrer-ctl add -m pef -i eth84:11 -i eth87:11 -e veth0:::
+   n2 xdpfrer-ctl add -m prf -i eth21:fl:20 -e veth0:5f00:0:0:8:f:1021:: -e veth2:5f00:0:0:8:f:2022::
+   n8 xdpfrer-ctl add -m pef -i eth84:rsid:f:10210 -i eth87:rsid:f:20220 -e veth0:::
    ```
 
    **Remove a flow** when it is no longer needed:
    ```
-   n2 xdpfrer-ctl del -m prf -i eth21:11
-   n8 xdpfrer-ctl del -m pef -i eth84:11
+   n2 xdpfrer-ctl del -m prf -i eth21:fl:20
+   n8 xdpfrer-ctl del -m pef -i eth84:rsid:f:10210 -i eth87:rsid:f:20220
    ```
 
 5. **Clean up:**
 
    Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
 
-## Measurements:
+### PREF: multiple replication
+
+`srv6_multi_prf.env` contains a 9-node topology with three redundant paths: `3` (n4–n5–n8), `4` (n4–n6–n8), and `2` (n2–n7–n8).
+`n2` replicates packets onto path `1` (via n3 to n4) and path `2` (via n7). `n4` further replicates path `1` into `3` (via n5) and `4` (via n6). As a result, `n8` receives three copies of the same packet and performs elimination.
+The `-n` flag on `n4` removes the SRH while preserving the Redundancy SID (flow_id and sequence number) in the outer IPv6 header. The destination locator is rewritten per egress interface.
+
+```
+                                                     ┌────────┐                           
+                                            "3" path │        │                           
+                                                  ┌──┤   n5   ├──┐                        
+                          ┌────────┐  ┌────────┐  │  │        │  │                        
+                 "1" path │        │  │        ├──┘  └────────┘  │                        
+                        ┌─┤   n3   ├──┤   n4   │     ┌────────┐  │                        
+┌────────┐   ┌────────┐ │ │        │  │   prf  ├──┐  │        │  │ ┌────────┐   ┌────────┐
+│        │   │        ├─┘ └────────┘  └────────┘  └──┤   n6   │  └─┤        │   │        │
+│   n1   ├───┤   n2   │   ┌────────┐        "4" path │        ├────┤   n8   ├───┤   n9   │
+│        │   │   prf  ├─┐ │        │                 └────────┘  ┌─┤   pef  │   │        │
+└────────┘   └────────┘ └─┤   n7   ├─────────────────────────────┘ └────────┘   └────────┘
+                          │        │                                                      
+                 "2" path └────────┘                                                      
+```
+
+1. **Start the environment:**
+
+   ```
+   cd test
+   sudo su
+   source srv6_multi_prf.env
+   ```
+
+2. **Start xdpfrer on the replication and elimination nodes:**
+
+   Configure `n2` for replication, `n4` for intermediate replication (with `-n`), and `n8` for elimination:
+
+   ```
+   n2 xdpfrer -m prf -i eth21:fl:10 -e veth0:5f00:0:0:4:f:1011:: -e veth2:5f00:0:0:8:f:2012::
+   n4 xdpfrer -m prf -i eth43:rsid:f:10110 -e veth0:5f00:0:0:8:f:3013:: -e veth2:5f00:0:0:8:f:4014:: -n
+   n8 xdpfrer -m pef -i eth85:rsid:f:30130 -i eth86:rsid:f:40140 -i eth87:rsid:f:20120 -e veth0:::
+   ```
+
+3. **Test connectivity:**
+
+   ```
+   n1 ping 5f00:0:0:89::9 -F 10  # replicated and eliminated
+   n1 ping 5f00:0:0:89::9        # normal forwarding
+   ```
+
+4. **Manage flows at runtime:**
+
+   In this example, we add flow label 20 using only path `1`, replicating packets to paths `3` and `4`. On `n2`, we need a command to redirect the packets to path `1` because the default route is path `2`.
+
+   ```
+   n2 xdpfrer-ctl add -m prf -i eth21:fl:20 -e veth0:5f00:0:0:4:f:1021::
+   n4 xdpfrer-ctl add -m prf -i eth43:rsid:f:10210 -e veth0:5f00:0:0:8:f:3023:: -e veth2:5f00:0:0:8:f:4024:: -n
+   n8 xdpfrer-ctl add -m pef -i eth85:rsid:f:30230 -i eth86:rsid:f:40240 -e veth0:::
+   ```
+
+5. **Clean up:**
+
+   Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
+
+### PREF: multiple elimination
+
+`srv6_multi_pef.env` contains this 7-node topology with three redundant paths: `1` (n3-n5), `2` (n4-n5), and `3` (direct n2-n6).
+`n2` replicates packets to all three paths; `n5` performs intermediate elimination, `n6` performs final elimination.
+The `-n` flag on `n5` removes SRH and rewrites the outer IPv6 destination address.
+The default path is path `3`.
+
+```
+                               ┌────────┐                                       
+                     "1" path  │        │                                       
+                   ┌───────────┤   n3   ├─┐ ┌────────┐                          
+                   │           │        │ │ │        │                          
+                   │           └────────┘ └─┤   n5   │                          
+                   │           ┌────────┐ ┌─┤   pef  ├─┐                        
+                   │  "2" path │        │ │ └────────┘ │ "1" path               
+                   │ ┌─────────┤   n4   ├─┘            │                        
+┌────────┐   ┌─────┴─┴┐        │        │              │ ┌────────┐   ┌────────┐
+│        │   │        │        └────────┘              │ │        │   │        │
+│   n1   ├───┤   n2   │                                └─┤   n6   ├───┤   n7   │
+│        │   │   prf  ├──────────────────────────────────┤   pef  │   │        │
+└────────┘   └────────┘             "3" path             └────────┘   └────────┘
+```
+
+1. **Start the environment:**
+
+   ```
+   cd test
+   sudo su
+   source srv6_multi_pef.env
+   ```
+
+2. **Start xdpfrer on the replication and elimination nodes:**
+
+   Configure `n2` for replication, `n5` for intermediate elimination (with `-n`), and `n6` for final elimination:
+
+   ```
+   n2 xdpfrer -m prf -i eth21:fl:10 -e veth0:5f00:0:0:5:f:1011:: -e veth2:5f00:0:0:5:f:2012:: -e veth4:5f00:0:0:6:f:3013::
+   n5 xdpfrer -m pef -i eth53:rsid:f:10110 -i eth54:rsid:f:20120 -e veth0:5f00:0:0:6:f:1014:: -n
+   n6 xdpfrer -m pef -i eth65:rsid:f:10140 -i eth62:rsid:f:30130 -e veth0:::
+   ```
+
+3. **Test connectivity:**
+
+   ```
+   n1 ping 5f00:0:0:67::7 -F 10  # replicated and eliminated
+   n1 ping 5f00:0:0:67::7        # normal forwarding
+   ```
+
+4. **Manage flows at runtime:**
+
+   In this example, we replicate flow 20 to path `1` and path `2`. On `n5`, elimination removes the duplicates and decapsulates the packets, so on `n6` these packets are unmatched.
+
+   ```
+   n2 xdpfrer-ctl add -m prf -i eth21:fl:20 -e veth0:5f00:0:0:5:f:1021:: -e veth2:5f00:0:0:5:f:2022::
+   n5 xdpfrer-ctl add -m pef -i eth53:rsid:f:10210 -i eth54:rsid:f:20220 -e veth0:::
+   ```
+
+5. **Clean up:**
+
+   Press `Ctrl+C` to stop xdpfrer, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.
+
+## Limitations
+
+- The history window size is 64 bits. Packets that arrive more than 64 sequence numbers after the last accepted one are treated as out-of-window and dropped.
+- The SRH (Segment Routing Header) can contain at most 6 SIDs. During elimination, the SRH must be removed, which requires knowing its exact size. Since the eBPF verifier does not allow computing the size dynamically, a fixed set of 
+allowed sizes is used. This could be increased by adding more switch cases.
+- The number of concurrent flows is limited to 128 (both sequence number generators and recovery instances). Increasing this requires changing the BPF map sizes.
+- Replication supports up to 8 egress interfaces per flow.
+- In PREF mode, a dedicated veth pair is required for each redundant path.
+- Each `xdpfrer` or `xdpfrer-ctl` command adds one flow at a time, as each invocation creates a single sequence number generator or history window.
+- `xdpfrer-ctl` only works in PREF mode.
+- XDP allows only one program per interface. If you attach replication on an interface, you can't also attach elimination on the same interface.
+
+## Wireshark Plugin
+
+A Lua dissector plugin (`test/pref_sid.lua`) is provided for decoding the PREF Redundancy SID fields in Wireshark.
+It parses the Locator, Function, Flow ID, Sequence number, and Reserved fields from the SID.
+
+The plugin handles two cases:
+- **IPv6-in-IPv6 (nexthdr=41):** The Redundancy SID is the outer IPv6 destination address (on veth interfaces after replication).
+- **SRH (nexthdr=43):** The Redundancy SID is the last segment in the SRH segment list (on egress interfaces after Linux adds the SRH).
+
+**Installation:**
+
+Copy the plugin to the global Wireshark Lua plugins directory:
+
+```
+sudo cp test/pref_sid.lua /usr/lib/x86_64-linux-gnu/wireshark/plugins/pref_sid.lua
+```
+
+Restart Wireshark. Verify it is loaded under `Help → About Wireshark → Plugins`.
+
+## Measurements
 
 For advanced usage, take a look at the `test/measurement.py` script.
 It is possible to run XDP FRER/PREF on a real, physical testbed, just change the interface names and VLAN IDs and the script accordingly.

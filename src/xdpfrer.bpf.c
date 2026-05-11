@@ -60,7 +60,7 @@ static int get_vlan_id(const struct xdp_md *pkt)
  * @param seq The sequence number that will appear in the R-tag.
  * @return 0 if successful, -1 if the packet is invalid or there is no space for the R-tag.
  */
-static inline int add_rtag(struct xdp_md *pkt, ushort *seq)
+static inline int add_rtag(struct xdp_md *pkt, uint16_t *seq)
 {
     // Make room for the R-tag at the beginning of the packet
     if (bpf_xdp_adjust_head(pkt, 0 - (int)rtaghdr_sz))
@@ -90,9 +90,10 @@ static inline int add_rtag(struct xdp_md *pkt, ushort *seq)
  * @brief Remove the R-tag from the packet's header. R-tag can be found after the VLAN ID.
  * @param pkt The packet with headers.
  * @param seq A pointer that will store the sequence number from the packet's R-tag.
+ * @param skip_remove Remove the R-tah or not.
  * @return 0 if successful, -1 if the packet is invalid or the R-tag removal failed.
  */
-static inline int rm_rtag(struct xdp_md *pkt, ushort *seq)
+static inline int rm_rtag(struct xdp_md *pkt, uint16_t *seq, bool skip_remove)
 {
     // Error bound check for the sake of the verifier
     void *data = (void *)(long) pkt->data;
@@ -109,7 +110,7 @@ static inline int rm_rtag(struct xdp_md *pkt, ushort *seq)
     *seq = bpf_ntohs(rtag->seq);
 
     // Remove the R-tag
-    if (add_or_rm_rtag) {
+    if (!skip_remove) {
         __builtin_memmove(data + rtaghdr_sz, data, ethhdr_sz + vlanhdr_sz);
         if (bpf_xdp_adjust_head(pkt, (int)rtaghdr_sz))
             return -1;
@@ -178,7 +179,7 @@ int replicate(struct xdp_md *pkt)
     if (data + ethhdr_sz + vlanhdr_sz > data_end)
         return XDP_DROP;
 
-    int vid = get_vlan_id(pkt);
+    int64_t vid = get_vlan_id(pkt);
     if (vid < 0)
         return XDP_DROP;
 
@@ -186,7 +187,7 @@ int replicate(struct xdp_md *pkt)
     if (!gen)
         return XDP_DROP;
 
-    if (add_or_rm_rtag) {
+    if (!gen->no_encap) {
         uint16_t seq = gen_seq(gen);
         int ret = add_rtag(pkt, &seq);
         if (ret < 0)
@@ -224,16 +225,20 @@ int eliminate(struct xdp_md *pkt)
     if (ret < 0)
         goto drop;
 
-    int vid = get_vlan_id(pkt);
+    int64_t vid = get_vlan_id(pkt);
     if (vid < 0)
         goto drop;
 
-    struct seq_rcvy_and_hist *rec = bpf_map_lookup_elem(&seqrcvy_map, &vid);
+    int *rcvy_idx = bpf_map_lookup_elem(&seqrcvy_idx_map, &vid);
+    if (!rcvy_idx)
+        goto drop;
+
+    struct seq_rcvy_and_hist *rec = bpf_map_lookup_elem(&seqrcvy_map, rcvy_idx);
     if (!rec)
         goto drop;
 
-    ushort seq;
-    ret = rm_rtag(pkt, &seq);
+    uint16_t seq;
+    ret = rm_rtag(pkt, &seq, rec->no_encap);
     if (ret < 0)
         goto drop;
 

@@ -15,13 +15,14 @@ RUN apt install --quiet --yes \
     binutils-dev \
     libbpf-dev \
     libcap-dev \
+    libssl-dev \
     wget
 
 RUN git clone --recurse-submodules https://github.com/libbpf/bpftool.git
 WORKDIR bpftool/src
-RUN make
+RUN make -j$(nproc)
 RUN make install
 
 ADD ./src /tmp/src/
 WORKDIR /tmp/src
-RUN make static
+RUN make -j$(nproc) TARGET_ARCH=arm64
