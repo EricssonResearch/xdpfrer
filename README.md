@@ -75,10 +75,6 @@ sudo apt install build-essential gcc-multilib clang llvm linux-tools-common bpft
 │   ├── xdpfrer.c          // Configure and load the BPF part to the kernel
 │   └── xdppref.bpf.c      // XDP programs for PREF (SRv6-based)
 └── test
-    ├── development
-    │   ├── srv6_test.py   // 6-node SRv6 PREF topology (Mininet)
-    │   ├── srv6_test.env  // 6-node SRv6 PREF topology (bash)
-    │   └── README.md      // Detailed SRv6 PREF internals
     ├── measurement.py     // All-in-one testing and plotting script
     ├── srv6.env           // 9-node SRv6 PREF topology (bash)
     ├── srv6_multi_prf.env // 9-node SRv6 PREF topology with multiple replication (bash)
