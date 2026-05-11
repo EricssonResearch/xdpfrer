@@ -47,6 +47,7 @@ Cite as:
    - [PREF: multiple replication](#pref-multiple-replication)
    - [PREF: multiple elimination](#pref-multiple-elimination)
 - [Limitations](#limitations)
+- [Wireshark Plugin](#wireshark-plugin)
 - [Measurements](#measurements)
 
 ## Requirements
@@ -75,6 +76,7 @@ sudo apt install build-essential gcc-multilib clang llvm linux-tools-common bpft
 │   ├── xdpfrer.c          // Configure and load the BPF part to the kernel
 │   └── xdppref.bpf.c      // XDP programs for PREF (SRv6-based)
 └── test
+    ├── pref_sid.lua       // Wireshark plugin for PREF SID
     ├── measurement.py     // All-in-one testing and plotting script
     ├── srv6.env           // 9-node SRv6 PREF topology (bash)
     ├── srv6_multi_prf.env // 9-node SRv6 PREF topology with multiple replication (bash)
@@ -655,6 +657,25 @@ allowed sizes is used. This could be increased by adding more switch cases.
 - Each `xdpfrer` or `xdpfrer-ctl` command adds one flow at a time, as each invocation creates a single sequence number generator or history window.
 - `xdpfrer-ctl` only works in PREF mode.
 - XDP allows only one program per interface. If you attach replication on an interface, you can't also attach elimination on the same interface.
+
+## Wireshark Plugin
+
+A Lua dissector plugin (`test/pref_sid.lua`) is provided for decoding the PREF Redundancy SID fields in Wireshark.
+It parses the Locator, Function, Flow ID, Sequence number, and Reserved fields from the SID.
+
+The plugin handles two cases:
+- **IPv6-in-IPv6 (nexthdr=41):** The Redundancy SID is the outer IPv6 destination address (on veth interfaces after replication).
+- **SRH (nexthdr=43):** The Redundancy SID is the last segment in the SRH segment list (on egress interfaces after Linux adds the SRH).
+
+**Installation:**
+
+Copy the plugin to the global Wireshark Lua plugins directory:
+
+```
+sudo cp test/pref_sid.lua /usr/lib/x86_64-linux-gnu/wireshark/plugins/pref_sid.lua
+```
+
+Restart Wireshark. Verify it is loaded under `Help → About Wireshark → Plugins`.
 
 ## Measurements
 
