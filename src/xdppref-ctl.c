@@ -40,7 +40,7 @@ struct ingress_entry {
 static void usage(void)
 {
     fprintf(stderr,
-        "Usage: xdpfrer-ctl <command> [options]\n"
+        "Usage: xdppref-ctl <command> [options]\n"
         "\n"
         "Commands:\n"
         "  list                          List active flows\n"
@@ -50,11 +50,11 @@ static void usage(void)
         "Modes: prf (replication), pef (elimination)\n"
         "\n"
         "Examples:\n"
-        "  xdpfrer-ctl add -m prf -i eth0:fl:10 -e veth0:5f00::1 [-e ...] [-n]\n"
-        "  xdpfrer-ctl add -m pef -i eth0:rsid:f:10110 [-i ...] -e veth0::: [-n]\n"
-        "  xdpfrer-ctl del -m prf -i eth0:fl:10\n"
-        "  xdpfrer-ctl del -m pef -i eth0:rsid:f:10110 [-i ...]\n"
-        "  xdpfrer-ctl list\n"
+        "  xdppref-ctl add -m prf -i eth0:fl:10 -e veth0:5f00::1 [-e ...] [-n]\n"
+        "  xdppref-ctl add -m pef -i eth0:rsid:f:10110 [-i ...] -e veth0::: [-n]\n"
+        "  xdppref-ctl del -m prf -i eth0:fl:10\n"
+        "  xdppref-ctl del -m pef -i eth0:rsid:f:10110 [-i ...]\n"
+        "  xdppref-ctl list\n"
         "\n"
         "Options:\n"
         "  -m <mode>   Mode: prf or pef\n"

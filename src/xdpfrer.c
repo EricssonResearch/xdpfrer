@@ -33,7 +33,6 @@ static unsigned int egress_size = 0;
 static bool no_encap = false;
 static bool quiet_output = false;
 static unsigned int next_rcvy_idx = 0;
-static unsigned char dst_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
 
 // xdp_attach_mode from libxdp.h
 // licensed under BSD-2
@@ -260,7 +259,9 @@ static int configure_replication(struct skel_fds *fds, struct config_item *cfg)
     }
 
     close(tx_ifaces_map_fd);
-    config_xdp_prog(fds, cfg);
+    ret = config_xdp_prog(fds, cfg);
+    if (ret < 0)
+        return ret;
 
     struct seq_gen new_gen = {};
     new_gen.no_encap = no_encap;
@@ -313,7 +314,9 @@ static int configure_elimination(struct skel_fds *fds, struct config_item *cfg, 
         return -EINVAL;
     }
 
-    config_xdp_prog(fds, cfg);
+    ret = config_xdp_prog(fds, cfg);
+    if (ret < 0)
+        return ret;
 
     // Initialize recovery state (history window) at the shared index (only once)
     struct seq_rcvy_and_hist new_rec = {};
@@ -783,14 +786,6 @@ static int parse_opt(int key, char *arg, struct argp_state *state) {
         case 'q':
             quiet_output = true;
             break;
-        case 'd':
-            if (sscanf(arg, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-                        &dst_mac[0], &dst_mac[1], &dst_mac[2],
-                        &dst_mac[3], &dst_mac[4], &dst_mac[5]) != 6) {
-                fprintf(stderr, "Invalid MAC address '%s'. Use format XX:XX:XX:XX:XX:XX\n", arg);
-                exit(EXIT_FAILURE);
-            }
-            break;
     }
     return 0;
 }
@@ -813,12 +808,10 @@ int main(int argc, char* argv[])
     {
         { 0, 0, 0, 0, "Required options:", 1},
         { "mode", 'm', "WORD", 0, "Mode: repl/elim (FRER) or prf/pef (PREF).", 1},
-        { "ingress", 'i', "WORD", 0, "Ingress interface in IFNAME:VID (FRER) or IFNAME:fl:FLOW_LABEL or IFNAME:rsid:FUNCT:FLOW_ID (PREF) format.", 1},
-        { "egress", 'e', "WORD", 0, "Egress interface in IFNAME:VID (FRER) or IFNAME:ADDR (PREF) format.", 1},
+        { "ingress", 'i', "WORD", 0, "Ingress interface in IFNAME:VID (Ethernet/FRER) or IFNAME:fl:FLOW_LABEL or IFNAME:rsid:FUNCT:FLOW_ID (SRv6/PREF) format.", 1},
+        { "egress", 'e', "WORD", 0, "Egress interface in IFNAME:VID (Ethernet/FRER) or IFNAME:ADDR (SRv6/PREF) format.", 1},
         { 0, 0, 0, 0, "Optional:", 2},
-        { "dmac", 'd', "MAC", 0, "Destination MAC address for PREF mode (XX:XX:XX:XX:XX:XX). " \
-          "Default value is 02:00:00:00:00:01.", 2},
-        { "not", 'n', 0, 0, "Don't add/remove R-tag (FRER) or don't encapsulate/decapsulate (PREF).", 2},
+        { "not", 'n', 0, 0, "Don't add/remove R-tag (Ethernet/FRER) or don't encapsulate/decapsulate (SRv6/PREF).", 2},
         { "quiet", 'q', 0, 0, "Quiet output.", 2},
         { "help", 'h', 0, 0, "Show this help message.", 3},
         { 0 }
@@ -863,7 +856,6 @@ int main(int argc, char* argv[])
             ret = EXIT_FAILURE;
             goto end;
         }
-        __builtin_memcpy(pref_skel->data->dst_mac, dst_mac, 6);
 
         fds.seqgen_map = bpf_map__fd(pref_skel->maps.seqgen_map);
         fds.replicate_tx_map = bpf_map__fd(pref_skel->maps.replicate_tx_map);
