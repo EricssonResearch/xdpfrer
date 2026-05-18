@@ -1,6 +1,6 @@
 # XDP FRER / XDP PREF
 
-This software is an experimental implementation of the IEEE 802.1CB FRER [standard](https://standards.ieee.org/ieee/802.1CB/5703/)
+This software is an experimental implementation of the [IEEE 802.1CB](https://standards.ieee.org/ieee/802.1CB/5703/) FRER standard
 and [SRv6 Redundancy SID](https://datatracker.ietf.org/doc/draft-ietf-spring-sr-redundancy-protection/).
 It replicates packets over redundant network paths to protect against network failures.
 On the sender side, this is called *replication*. On the receiver side, *elimination* accepts the first copy and drops the duplicates.
@@ -80,11 +80,11 @@ sudo apt install build-essential gcc-multilib clang llvm linux-tools-common bpft
 └── test
     ├── pref_sid.lua       // Wireshark plugin for Redundancy SID
     ├── measurement.py     // All-in-one testing and plotting script
+    ├── frer_physical.env  // 3-node FRER topology for physical performance testbed (bash)
+    ├── frer.env           // 3-node FRER topology using veth pairs and namespaces (bash)
     ├── srv6.env           // 9-node SRv6 PREF topology (bash)
     ├── srv6_multi_prf.env // 9-node SRv6 PREF topology with multiple replication (bash)
-    ├── srv6_multi_pef.env // 7-node SRv6 PREF topology with multiple elimination (bash)
-    ├── physical.env       // 3-node FRER topology for physical testbed (bash)
-    └── frer.env           // 3-node FRER topology using veth pairs and namespaces (bash)
+    └── srv6_multi_pef.env // 7-node SRv6 PREF topology with multiple elimination (bash)
 ```
 
 ## Building
@@ -129,17 +129,18 @@ __Important:__
 
 * In replication modes `repl` and `prf` one or more `--egress` and only one `--ingress` interface can be used.
 * In elimination modes `elim` and `pef` one or more `--ingress` and only one `--egress` interface can be used.
-* Flows can be added or removed at runtime with the `xdppref-ctl` helper tool.
-The format of the command-line arguments is the same as the `xdpfrer` case.
-It only works for PREF modes (`prf`/`pef`).
-The code only pins BPF maps (to `/sys/fs/bpf/xdpfrer`) when running in PREF mode.
-This is why `xdppref-ctl` only works for PREF, it relies on pinned maps.
+* In PREF modes (`prf`/`pef`), flows can be added or removed at runtime using the `xdppref-ctl` helper tool,
+which accepts the same command-line argument format as `xdpfrer`.
+The `xdppref-ctl` tool relies on pinned BPF maps (at `/sys/fs/bpf/xdpfrer`),
+which are only created when running in PREF mode.
 * In FRER mode (`repl`/`elim`), VLAN IDs cannot be modified at runtime. To change the configuration, stop and restart `xdpfrer`.
 
 ## Packet Format and Examples
 
 This section describes the packet headers used in Layer 2 (FRER) and Layer 3 (PREF),
 how they are modified during replication and elimination, and provides command-line examples for each mode.
+In Layer 2 (FRER), packets that do not match the configured flow are dropped,
+while in Layer 3 (PREF), unmatched packets are passed to the Linux Network Stack for normal processing.
 
 ### Layer 2 (FRER)
 
@@ -363,19 +364,19 @@ veth0:
 └─────────┴───────────────────┘
 ```
 
-In this implementation of the Layer 3 case, the `xdpfrer` nodes should be the
-SRv6 tunnel endpoints. At the endpoints, flows are identified by their IPv6 flow label;
-inside the tunnel, they are identified by the Redundancy SID.
+In this implementation of the Layer 3 case, the `xdpfrer` nodes are SRv6 tunnel endpoints.
+At the edge nodes, flows are identified by their IPv6 flow label;
+at the tunnel endpoints, they are identified by the Redundancy SID (Flow ID).
 
 **Note:** Packets with matching flow labels are sent to a PREF-specific internal veth interface,
-so `xdpfrer` rewrites the destination MAC address to match the veth interface's MAC address,
-allowing the node to accept the packet for further Layer 3 processing (e.g., routing, SRv6 operations, ARP/ND).
+so `xdpfrer` rewrites the destination MAC address to match the PREF-specific internal veth interface's MAC address (`02:00:00:00:00:01`),
+allowing the node to accept the packet at the veth interface for further Layer 3 processing (e.g., routing, SRv6 operations, ARP/ND).
 
 ## Test environments and usage
 
 ### Layer 2 (FRER): bash-based environment
 
-`physical.env` and `frer.env` contain this environment. Obviously you can modify VLANs
+`frer_physical.env` and `frer.env` contain this environment. Obviously you can modify VLANs
 when you start running `xdpfrer` instances. In FRER mode, only one VLAN ID can be matched per ingress interface,
 so only a single stream is supported per direction.
 
@@ -701,19 +702,19 @@ The default path is path `3`.
 - The number of concurrent flows is limited to 128 (both sequence number generators and recovery instances). Increasing this requires changing the BPF map sizes.
 - `xdppref-ctl` only works in Layer 3 PREF mode.
 - Each `xdpfrer` or `xdppref-ctl` command adds one flow at a time, as each invocation creates a single sequence number generator or history window.
+- XDP allows only one program per interface. An interface can only be used as ingress once, but can appear as egress in multiple instances.
 
 **Replication/Elimination:**
 
-- The history window size is 64 bits.
+- The history window size is 64 bits. For details, see [IEEE 802.1CB](https://standards.ieee.org/ieee/802.1CB/5703/) section 7.4.3.2.2 and 7.4.3.4.
 - Replication supports up to 8 egress interfaces per flow.
-- XDP allows only one program per interface. An interface can only be used as ingress once, but can appear as egress in multiple instances.
 
 **Encapsulation:**
 
-- The Maximum SID Depth (MSD) is 6. During elimination, the SRH must be removed, which requires knowing its exact size. Since the eBPF verifier does not allow computing the size dynamically, a fixed set of allowed sizes is used. This could be increased by adding more switch cases.
-- In PREF mode, a PREF-specific internal veth pair is required for each redundant path.
 - Flows are identified by VLAN ID (Layer 2) and Flow Label (Layer 3).
 - In FRER mode (repl/elim), VLAN IDs cannot be modified at runtime. To change the configuration, stop and restart `xdpfrer`.
+- In PREF mode, a PREF-specific internal veth pair is required for each redundant path.
+- The Maximum SID Depth (MSD) is 6. During elimination, the SRH must be removed, which requires knowing its exact size. Since the eBPF verifier does not allow computing the size dynamically, a fixed set of allowed sizes is used. This could be increased by adding more switch cases.
 
 ## Wireshark Plugin
 
@@ -725,7 +726,8 @@ The plugin handles two cases:
 - **SRH (nexthdr=43):** The Redundancy SID is the last segment in the SRH segment list (on egress interfaces after Linux adds the SRH).
 
 The plugin recognizes a Redundancy SID by checking that the first two bytes of the address are `0x5f00`
-and that the Function field is non-zero.
+and that the Function field is non-zero. Additionally, if all bits after the Function field are zero,
+the address is treated as a regular SRv6 SID rather than a Redundancy SID.
 
 **Installation:**
 
