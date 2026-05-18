@@ -15,6 +15,8 @@ pref.fields = { f_loc, f_funct, f_flowid, f_seq, f_resv }
 local function decode_sid(sid_buf, pinfo, tree, label)
     if sid_buf(0, 2):uint() ~= 0x5f00 then return false end
     if sid_buf(8, 2):uint() == 0 then return false end
+    -- If all bits after Function are zero, it is a regular SRv6 SID, not a Redundancy SID
+    if sid_buf(10, 4):uint() == 0 and sid_buf(14, 2):uint() == 0 then return false end
 
     local subtree = tree:add(pref, sid_buf, label)
     subtree:add(f_loc, sid_buf(0, 8))
