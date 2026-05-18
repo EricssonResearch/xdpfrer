@@ -3,7 +3,7 @@
 This software is an experimental implementation of the [IEEE 802.1CB](https://standards.ieee.org/ieee/802.1CB/5703/) FRER standard
 and [SRv6 Redundancy SID](https://datatracker.ietf.org/doc/draft-ietf-spring-sr-redundancy-protection/).
 It replicates packets over redundant network paths to protect against network failures.
-On the sender side, this is called *replication*. On the receiver side, *elimination* accepts the first copy and drops the duplicates.
+The implemented functions are called *replication* (generates copies and send them over disjoint paths) and *elimination* (accepts the first copy and drops the duplicates).
 
 **Provided functions:**
 * Replication and elimination functionality:
@@ -15,9 +15,12 @@ On the sender side, this is called *replication*. On the receiver side, *elimina
 
 The implementation uses XDP, a high-performance packet processing framework in the Linux kernel based on eBPF.
 
-The details of the experiment are discussed in the following research paper:
+The details of the experiment are discussed in the following research papers and standard documents:
 
-__Lightweight Implementation of Per-packet Service Protection in eBPF/XDP__ ([pdf](https://netdevconf.info/0x17/docs/netdev-0x17-paper25-talk-paper.pdf) | [arxiv](https://arxiv.org/abs/2312.07152) | [slides](https://netdevconf.info/0x17/docs/netdev-0x17-paper25-talk-slides/netdev0x17_xdpfrer_slides.pdf))
+* __Stream identification functionality__ ([IEEE 802.1CB](https://standards.ieee.org/ieee/802.1CB/5703/), [RFC8939](http://datatracker.ietf.org/doc/rfc8939/))
+* __Replication and Elimination functionalities__ ([IEEE 802.1CB](https://standards.ieee.org/ieee/802.1CB/5703/))
+* __SRv6 for Redundancy Protection__ ([SRv6 for Redundancy Protection](https://datatracker.ietf.org/doc/draft-ietf-spring-sr-redundancy-protection/), [Deterministic Networking SRv6 Data Plane for Service Protection](https://datatracker.ietf.org/doc/draft-varga-detnet-srv6-data-plane/))
+* __Lightweight Implementation of Per-packet Service Protection in eBPF/XDP__ ([pdf](https://netdevconf.info/0x17/docs/netdev-0x17-paper25-talk-paper.pdf) | [arxiv](https://arxiv.org/abs/2312.07152) | [slides](https://netdevconf.info/0x17/docs/netdev-0x17-paper25-talk-slides/netdev0x17_xdpfrer_slides.pdf))
 
 Cite as:
 
