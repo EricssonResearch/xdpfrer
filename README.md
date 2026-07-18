@@ -546,6 +546,59 @@ Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `
    n8 xdppref-ctl del -m pef -i eth84:rsid:f:10210 -i eth87:rsid:f:20220
    ```
 
+   **Match flows by a pcap filter expression (source IP based):**
+
+   Besides flow-label (`fl`) and Redundancy SID (`rsid`) matching, a replication
+   ingress can also be selected by a **tcpdump/pcap filter expression** using the
+   `IFNAME:filter:EXPR` form. The expression is compiled to classic BPF by libpcap
+   in `xdppref-ctl` and evaluated in the kernel before encapsulation, so it can match
+   on any field libpcap understands (IPv4/IPv6, `src`/`dst host`, ports, ...) without
+   hand-written header parsing. Filter matching is **replication-ingress only** and is
+   tried only when `fl`/`rsid` do not match, so it does not affect the existing flows.
+
+   In this topology every packet `n1` sends leaves it with source address
+   `5f00:0:0:12::1` (its `eth12` link address). We can therefore replicate **all**
+   traffic originating from `n1` — regardless of flow label — by matching on that
+   source address. Add a filter flow on `n2` and the matching elimination flow on
+   `n8` (new locators `1031`/`2032` are covered by the existing `.../84` SRv6 routes,
+   so path `1`/`2` selection works without adding routes):
+
+   ```
+   n2 xdppref-ctl add -m prf -i 'eth21:filter:ip6 and src host 5f00:0:0:12::1' \
+        -e veth0:5f00:0:0:8:f:1031:: -e veth2:5f00:0:0:8:f:2032::
+   n8 xdppref-ctl add -m pef -i eth84:rsid:f:10310 -i eth87:rsid:f:20320 -e veth0:::
+   ```
+
+   > The whole `-i` argument must be quoted: the expression contains spaces, and
+   > everything after `filter:` (including the colons of the IPv6 address) is taken
+   > verbatim as the pcap expression.
+
+   Now a **plain** ping from `n1` — with no flow label — is replicated and eliminated,
+   because it matches the source-IP filter (previously this was "normal forwarding"):
+
+   ```
+   n1 ping 5f00:0:0:89::9        # now replicated+eliminated via the source-IP filter
+   n1 ping 5f00:0:0:89::9 -F 10  # still uses the fl:10 flow (matched before filters)
+   ```
+
+   The installed filter is visible in `list` under `pcap_filter_map` (the `match_id`
+   is a synthetic value reserved for filter flows and printed in hex):
+
+   ```
+   n2 xdppref-ctl list
+   # ...
+   # - pcap_filter_map:
+   #     slot=0 len=12 match_id=0xffff00000
+   ```
+
+   Remove the filter flow by passing the same expression (it is recompiled and matched
+   back to its slot):
+
+   ```
+   n2 xdppref-ctl del -m prf -i 'eth21:filter:ip6 and src host 5f00:0:0:12::1'
+   n8 xdppref-ctl del -m pef -i eth84:rsid:f:10310 -i eth87:rsid:f:20320
+   ```
+
 5. **Clean up:**
 
    Press `Ctrl+C` to stop `xdpfrer`, then `Ctrl+D` or type `exit` in both terminals. The last terminal to exit tears down the environment.

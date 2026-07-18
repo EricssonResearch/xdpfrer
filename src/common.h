@@ -7,6 +7,33 @@
 #define FRER_TIMEOUT_CHECK_PERIOD_NS ((1000*1000*1000) / 100) //every 10ms
 #define MAX_FLOWS 128
 
+// tcpdump expression filtering done with a minimal, computationally bounded
+// cBPF interpreter. Userspace xdppref-ctl :filter: option uses it:
+//      filter expr. -> libpcap -> cBPF filter -> eBPF filter
+#define MAX_CBPF_INSNS 64          // max classic-BPF instructions per filter (power of two)
+#define MAX_PCAP_FILTERS 8         // max simultaneously installed pcap filters
+
+// With :fl: match flowlabel+ifindex used as key for postprocessing RSID.
+// When :filter: is in use, we need a match_id+ifinex at postprocessing for that.
+// The match_id simply the slot used in the BPF map of filter expr. programs
+#define FILTER_FUNCT_MARKER 0xFFFF
+#define FILTER_MATCH_ID(slot) (((int64_t)FILTER_FUNCT_MARKER << 20) | ((slot) & 0xFFFFF))
+
+// One classic-BPF instruction (mirrors libpcap's struct bpf_insn layout).
+struct cbpf_insn {
+    uint16_t code;
+    uint8_t jt;
+    uint8_t jf;
+    uint32_t k;
+};
+
+// A compiled pcap filter bound to a flow match_id. len == 0 marks a free slot.
+struct pcap_filter {
+    uint32_t len;                          // number of valid instructions (0 = unused)
+    int64_t match_id;                      // flow this filter selects on match
+    struct cbpf_insn insns[MAX_CBPF_INSNS];
+};
+
 #ifndef CLOCK_MONOTONIC
 #define CLOCK_MONOTONIC 1
 #endif

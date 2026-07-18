@@ -14,12 +14,14 @@
 #include <sys/stat.h>
 
 #include "common.h"
+#include "pcap_util.h"
 #include "xdpfrer.skel.h"
 #include "xdppref.skel.h"
 
 #define MAX_IFACES 16
 #define MAX_IFNAME_LEN 16
 #define MAX_CFG_ENTRIES 16
+#define MAX_FILTER_EXPR_LEN 256
 #define PIN_DIR "/sys/fs/bpf/xdpfrer"
 
 enum program_mode mode;
@@ -63,14 +65,17 @@ struct egress_info {
 };
 
 enum match_type {
-    MATCH_FL,   // Match on IPv6 flow label
-    MATCH_RSID  // Match on PREF SID function + flow_id
+    MATCH_FL,    // Match on IPv6 flow label
+    MATCH_RSID,  // Match on PREF SID function + flow_id
+    MATCH_FILTER // Match on a compiled pcap filter (replication ingress only)
 };
 
 struct pref_match {
     enum match_type mtype;
     uint16_t funct;
     uint32_t flow_id;
+    int slot;                            // pcap_filter_map slot (MATCH_FILTER); -1 until installed
+    char filter_expr[MAX_FILTER_EXPR_LEN]; // pcap expression (MATCH_FILTER)
 };
 
 struct ingress_info {
@@ -107,6 +112,7 @@ struct skel_fds {
     int seqrcvy_map;
     int eliminate_tx_map;
     int dst_addr_map;
+    int pcap_filter_map;
     int rvt_map;
     int evt_map;
     int replicate_prog;
@@ -196,9 +202,56 @@ static int64_t get_map_key(struct config_item *cfg)
 {
     if (cfg->mode == FRER_REPL || cfg->mode == FRER_ELIM)
         return (int64_t)cfg->vid;
+    if (cfg->pmatch.mtype == MATCH_FILTER)
+        return FILTER_MATCH_ID(cfg->pmatch.slot);
     if (cfg->pmatch.mtype == MATCH_RSID)
         return ((int64_t)cfg->pmatch.funct << 20) | (cfg->pmatch.flow_id & 0xFFFFF);
     return (int64_t)cfg->pmatch.flow_id;
+}
+
+/**
+ * @brief Compile the config's pcap expression and install it into a free slot of
+ * pcap_filter_map, recording the slot in cfg->pmatch.slot. Idempotent: does nothing
+ * if a slot is already assigned.
+ * @return 0 on success, -1 on failure.
+ */
+static int install_daemon_filter(int fmap_fd, struct config_item *cfg)
+{
+    if (cfg->pmatch.slot >= 0)
+        return 0; // already installed
+
+    if (fmap_fd < 0) {
+        fprintf(stderr, "pcap_filter_map not available\n");
+        return -1;
+    }
+
+    struct pcap_filter pf;
+    if (compile_pcap_filter(cfg->pmatch.filter_expr, &pf) < 0)
+        return -1;
+
+    int slot = -1;
+    for (int i = 0; i < MAX_PCAP_FILTERS; i++) {
+        struct pcap_filter tmp;
+        if (bpf_map_lookup_elem(fmap_fd, &i, &tmp) == 0 && tmp.len == 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        fprintf(stderr, "No free pcap filter slots (max %d)\n", MAX_PCAP_FILTERS);
+        return -1;
+    }
+
+    pf.match_id = FILTER_MATCH_ID(slot);
+    if (bpf_map_update_elem(fmap_fd, &slot, &pf, BPF_ANY) < 0) {
+        fprintf(stderr, "Failed to install pcap filter: %s\n", strerror(errno));
+        return -1;
+    }
+
+    cfg->pmatch.slot = slot;
+    printf("Installed pcap filter slot=%d match_id=0x%lx: '%s'\n",
+           slot, (long)FILTER_MATCH_ID(slot), cfg->pmatch.filter_expr);
+    return 0;
 }
 
 /**
@@ -212,6 +265,14 @@ static int64_t get_map_key(struct config_item *cfg)
 static int configure_replication(struct skel_fds *fds, struct config_item *cfg)
 {
     int ret = EXIT_SUCCESS;
+
+    // For filter flows, compile and install the pcap filter first so get_map_key()
+    // can derive the (slot-based) match ID.
+    if (cfg->mode == PREF_REPL && cfg->pmatch.mtype == MATCH_FILTER) {
+        if (install_daemon_filter(fds->pcap_filter_map, cfg) < 0)
+            return -EINVAL;
+    }
+
     int64_t key = get_map_key(cfg);
 
     if (fds->seqgen_map < 0 || fds->replicate_tx_map < 0) {
@@ -433,7 +494,7 @@ static void unpin_maps(void)
 {
     const char *names[] = { "seqgen_map", "replicate_tx_map", "seqrcvy_idx_map",
                             "seqrcvy_map", "eliminate_tx_map", "rvt", "evt",
-                            "dst_addr_map", "postprocessing_prog" };
+                            "dst_addr_map", "pcap_filter_map", "postprocessing_prog" };
     unsigned short names_size = sizeof(names)/sizeof(names[0]);
 
     for (unsigned short i = 0; i < names_size; i++) {
@@ -632,6 +693,7 @@ static int parse_opt(int key, char *arg, struct argp_state *state) {
     
     // Set variables based on given argp options
     char* token;
+    char* ingress_rest = NULL; // verbatim text after "IFNAME:" (for pcap filter expressions)
     switch (key) {
         case 'h':
             argp_state_help(state, stdout, ARGP_HELP_STD_HELP);
@@ -667,6 +729,13 @@ static int parse_opt(int key, char *arg, struct argp_state *state) {
                 exit(EXIT_FAILURE);
             }
 
+            // Capture the text after the first ':' verbatim before strtok() splits
+            // it, so a pcap filter expression (which contains ':' in IPv6 addresses)
+            // is preserved.
+            ingress_rest = strchr(arg, ':');
+            if (ingress_rest)
+                ingress_rest++;
+
             token = strtok(arg, ":");
             if (token == NULL) {
                 fprintf(stderr, "Invalid ingress format. Use IFNAME:NUM (e.g. eth0:10)\n");
@@ -677,6 +746,24 @@ static int parse_opt(int key, char *arg, struct argp_state *state) {
             if (!ingress_ifaces[ingress_size].ifidx) {
                 fprintf(stderr, "Interface '%s' not found\n", token);
                 exit(EXIT_FAILURE);
+            }
+
+            // pcap filter ingress (replication only). Everything after "IFNAME:filter:"
+            // is the tcpdump/pcap expression, taken verbatim.
+            if (mode == PREF_REPL && ingress_rest && strncmp(ingress_rest, "filter:", 7) == 0) {
+                const char *expr = ingress_rest + 7;
+                if (*expr == '\0') {
+                    fprintf(stderr, "Empty pcap filter expression\n");
+                    exit(EXIT_FAILURE);
+                }
+                ingress_ifaces[ingress_size].pmatch.mtype = MATCH_FILTER;
+                ingress_ifaces[ingress_size].pmatch.funct = 0;
+                ingress_ifaces[ingress_size].pmatch.flow_id = 0;
+                ingress_ifaces[ingress_size].pmatch.slot = -1;
+                strncpy(ingress_ifaces[ingress_size].pmatch.filter_expr, expr, MAX_FILTER_EXPR_LEN - 1);
+                ingress_ifaces[ingress_size].pmatch.filter_expr[MAX_FILTER_EXPR_LEN - 1] = '\0';
+                ingress_size++;
+                break;
             }
 
             token = strtok(NULL, ":");
@@ -808,7 +895,7 @@ int main(int argc, char* argv[])
     {
         { 0, 0, 0, 0, "Required options:", 1},
         { "mode", 'm', "WORD", 0, "Mode: repl/elim (FRER) or prf/pef (PREF).", 1},
-        { "ingress", 'i', "WORD", 0, "Ingress interface in IFNAME:VID (Ethernet/FRER) or IFNAME:fl:FLOW_LABEL or IFNAME:rsid:FUNCT:FLOW_ID (SRv6/PREF) format.", 1},
+        { "ingress", 'i', "WORD", 0, "Ingress interface in IFNAME:VID (Ethernet/FRER) or IFNAME:fl:FLOW_LABEL or IFNAME:rsid:FUNCT:FLOW_ID or IFNAME:filter:PCAP_EXPR (SRv6/PREF; filter is replication-ingress only, quote the whole argument) format.", 1},
         { "egress", 'e', "WORD", 0, "Egress interface in IFNAME:VID (Ethernet/FRER) or IFNAME:ADDR (SRv6/PREF) format.", 1},
         { 0, 0, 0, 0, "Optional:", 2},
         { "not", 'n', 0, 0, "Don't add/remove R-tag (Ethernet/FRER) or don't encapsulate/decapsulate (SRv6/PREF).", 2},
@@ -837,6 +924,7 @@ int main(int argc, char* argv[])
         fds.seqrcvy_map = bpf_map__fd(frer_skel->maps.seqrcvy_map);
         fds.eliminate_tx_map = bpf_map__fd(frer_skel->maps.eliminate_tx_map);
         fds.dst_addr_map = -1;
+        fds.pcap_filter_map = -1;
         fds.rvt_map = bpf_map__fd(frer_skel->maps.rvt);
         fds.evt_map = bpf_map__fd(frer_skel->maps.evt);
         fds.replicate_prog = bpf_program__fd(frer_skel->progs.replicate);
@@ -863,6 +951,7 @@ int main(int argc, char* argv[])
         fds.seqrcvy_map = bpf_map__fd(pref_skel->maps.seqrcvy_map);
         fds.eliminate_tx_map = bpf_map__fd(pref_skel->maps.eliminate_tx_map);
         fds.dst_addr_map = bpf_map__fd(pref_skel->maps.dst_addr_map);
+        fds.pcap_filter_map = bpf_map__fd(pref_skel->maps.pcap_filter_map);
         fds.rvt_map = -1;
         fds.evt_map = -1;
         fds.replicate_prog = bpf_program__fd(pref_skel->progs.replicate);
@@ -888,6 +977,7 @@ int main(int argc, char* argv[])
         pin_map(pref_skel->maps.seqrcvy_map, "seqrcvy_map");
         pin_map(pref_skel->maps.eliminate_tx_map, "eliminate_tx_map");
         pin_map(pref_skel->maps.dst_addr_map, "dst_addr_map");
+        pin_map(pref_skel->maps.pcap_filter_map, "pcap_filter_map");
         pin_prog(fds.postprocessing_prog, "postprocessing_prog");
     }
 
