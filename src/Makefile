@@ -44,8 +44,8 @@ xdppref-ctl: xdppref-ctl.o pcap_util.o
 	$(CC) -g -O2 $^ -lbpf -lpcap -o $@
 
 install: xdpfrer xdppref-ctl
-	cp xdpfrer /usr/local/bin/
-	cp xdppref-ctl /usr/local/bin/
+	cp xdpfrer /bin/
+	cp xdppref-ctl /bin/
 
 clean:
 	rm -f *.o *.skel.h vmlinux.h xdpfrer xdppref-ctl
