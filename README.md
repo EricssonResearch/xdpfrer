@@ -117,7 +117,9 @@ Usage: xdpfrer [OPTION...]
                              IFNAME:ADDR (SRv6/PREF) format.
   -i, --ingress=WORD         Ingress interface in IFNAME:VID (Ethernet/FRER) or
                              IFNAME:fl:FLOW_LABEL or IFNAME:rsid:FUNCT:FLOW_ID
-                             (SRv6/PREF) format.
+                             or IFNAME:filter:PCAP_EXPR (SRv6/PREF; filter is
+                             replication-ingress only, quote the whole
+                             argument) format.
   -m, --mode=WORD            Mode: repl/elim (FRER) or prf/pef (PREF).
 
  Optional:
@@ -550,21 +552,24 @@ Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `
 
    Besides flow-label (`fl`) and Redundancy SID (`rsid`) matching, a replication
    ingress can also be selected by a **tcpdump/pcap filter expression** using the
-   `IFNAME:filter:EXPR` form. The expression is compiled to classic BPF by libpcap
+   `IFNAME:filter:EXPR` form.
+
+   The expression is compiled to classic BPF by libpcap
    in `xdppref-ctl` and evaluated in the kernel before encapsulation, so it can match
    on any field libpcap understands (IPv4/IPv6, `src`/`dst host`, ports, ...) without
    hand-written header parsing. Filter matching is **replication-ingress only** and is
    tried only when `fl`/`rsid` do not match, so it does not affect the existing flows.
 
    In this topology every packet `n1` sends leaves it with source address
-   `5f00:0:0:12::1` (its `eth12` link address). We can therefore replicate **all**
-   traffic originating from `n1` — regardless of flow label — by matching on that
-   source address. Add a filter flow on `n2` and the matching elimination flow on
+   `5f00:0:0:1::111` (its a loopback address on `lo` interface).
+   We can therefore replicate **all** traffic originating from `n1` loopback - 
+   regardless of flow label - by matching on that source address. 
+   Add a filter flow on `n2` and the matching elimination flow on
    `n8` (new locators `1031`/`2032` are covered by the existing `.../84` SRv6 routes,
    so path `1`/`2` selection works without adding routes):
 
    ```
-   n2 xdppref-ctl add -m prf -i 'eth21:filter:ip6 and src host 5f00:0:0:12::1' \
+   n2 xdppref-ctl add -m prf -i 'eth21:filter:ip6 and src host 5f00:0:0:1::111' \
         -e veth0:5f00:0:0:8:f:1031:: -e veth2:5f00:0:0:8:f:2032::
    n8 xdppref-ctl add -m pef -i eth84:rsid:f:10310 -i eth87:rsid:f:20320 -e veth0:::
    ```
@@ -577,8 +582,14 @@ Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `
    because it matches the source-IP filter (previously this was "normal forwarding"):
 
    ```
-   n1 ping 5f00:0:0:89::9        # now replicated+eliminated via the source-IP filter
-   n1 ping 5f00:0:0:89::9 -F 10  # still uses the fl:10 flow (matched before filters)
+   # now replicated+eliminated via the source-IP filter
+   n1 ping 5f00:0:0:89::9 -I 5f00:0:0:1::111
+
+   # pure flowlabel based matching takes precedence
+   n1 ping 5f00:0:0:89::9 -F 10 -I 5f00:0:0:1::111
+
+   # if no flowlabel based stream exists, fall back to pcap filter
+   n1 ping 5f00:0:0:89::9 -F 123 -I 5f00:0:0:1::111
    ```
 
    The installed filter is visible in `list` under `pcap_filter_map` (the `match_id`
