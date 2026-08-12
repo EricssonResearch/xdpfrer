@@ -11,10 +11,12 @@
 #include <stdint.h>
 
 #include "common.h"
+#include "pcap_util.h"
 
 #define PIN_DIR "/sys/fs/bpf/xdpfrer"
 #define MAX_IFACES 16
 #define MAX_IFNAME_LEN 16
+#define MAX_FILTER_EXPR_LEN 256
 
 enum program_mode {
     FRER_ELIM,
@@ -25,13 +27,15 @@ enum program_mode {
 
 enum match_type {
     MATCH_FL,
-    MATCH_RSID
+    MATCH_RSID,
+    MATCH_FILTER
 };
 
 struct ingress_entry {
     char ifname[MAX_IFNAME_LEN];
     enum match_type mtype;
-    int64_t match_id; // flow_label or rsid
+    int64_t match_id; // flow_label or rsid (allocated for filters)
+    char filter_expr[MAX_FILTER_EXPR_LEN]; // pcap expression when mtype == MATCH_FILTER
 };
 
 /**
@@ -51,14 +55,20 @@ static void usage(void)
         "\n"
         "Examples:\n"
         "  xdppref-ctl add -m prf -i eth0:fl:10 -e veth0:5f00::1 [-e ...] [-n]\n"
+        "  xdppref-ctl add -m prf -i 'eth0:filter:ip6 and dst host 2001:db8::1' -e veth0:5f00::1\n"
         "  xdppref-ctl add -m pef -i eth0:rsid:f:10110 [-i ...] -e veth0::: [-n]\n"
         "  xdppref-ctl del -m prf -i eth0:fl:10\n"
+        "  xdppref-ctl del -m prf -i 'eth0:filter:ip6 and dst host 2001:db8::1'\n"
         "  xdppref-ctl del -m pef -i eth0:rsid:f:10110 [-i ...]\n"
         "  xdppref-ctl list\n"
         "\n"
         "Options:\n"
         "  -m <mode>   Mode: prf or pef\n"
-        "  -i <iface>  Ingress: IFNAME:fl:FLOW_LABEL or IFNAME:rsid:FUNCT:FLOW_ID\n"
+        "  -i <iface>  Ingress: IFNAME:fl:FLOW_LABEL | IFNAME:rsid:FUNCT:FLOW_ID |\n"
+        "              IFNAME:filter:EXPR  (EXPR is a tcpdump/pcap expression; quote the\n"
+        "              whole -i argument, e.g. -i 'eth0:filter:ip and src host 10.0.0.1').\n"
+        "              filter is replication-ingress only and may be repeated to match\n"
+        "              multiple flows to the same egress set.\n"
         "  -e <iface>  Egress: IFNAME:ADDR (IPv6 locator)\n"
         "  -n          Don't encapsulate/decapsulate (rewrite outer header)\n");
 }
@@ -137,6 +147,71 @@ static int find_next_rcvy_idx(int idx_fd)
             max_idx = idx;
     } while (bpf_map_get_next_key(idx_fd, &key, &next) == 0);
     return max_idx + 1;
+}
+
+/**
+ * @brief Find the first free slot in pcap_filter_map (len == 0).
+ * @return slot index on success, -1 if the map is full.
+ */
+static int alloc_filter_slot(int fmap_fd)
+{
+    for (int i = 0; i < MAX_PCAP_FILTERS; i++) {
+        struct pcap_filter f;
+        if (bpf_map_lookup_elem(fmap_fd, &i, &f) == 0 && f.len == 0)
+            return i;
+    }
+    return -1;
+}
+
+/**
+ * @brief Find an installed filter slot whose compiled bytecode matches `expr`.
+ * @param match_id_out Set to the bound flow match_id on success.
+ * @return slot index on success, -1 if not found or compilation fails.
+ */
+static int find_filter_slot_by_expr(int fmap_fd, const char *expr, int64_t *match_id_out)
+{
+    struct pcap_filter want;
+    if (compile_pcap_filter(expr, &want) < 0)
+        return -1;
+
+    for (int i = 0; i < MAX_PCAP_FILTERS; i++) {
+        struct pcap_filter f;
+        if (bpf_map_lookup_elem(fmap_fd, &i, &f) != 0)
+            continue;
+        if (f.len != 0 && f.len == want.len &&
+            memcmp(f.insns, want.insns, f.len * sizeof(struct cbpf_insn)) == 0) {
+            *match_id_out = f.match_id;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/**
+ * @brief Compile `expr`, place it in a free pcap_filter_map slot, and return the
+ * allocated flow match_id (FILTER_MATCH_ID(slot)).
+ * @return match_id on success, -1 on failure.
+ */
+static int64_t install_filter(int fmap_fd, const char *expr)
+{
+    struct pcap_filter pf;
+    if (compile_pcap_filter(expr, &pf) < 0)
+        return -1;
+
+    int slot = alloc_filter_slot(fmap_fd);
+    if (slot < 0) {
+        fprintf(stderr, "No free pcap filter slots (max %d)\n", MAX_PCAP_FILTERS);
+        return -1;
+    }
+
+    int64_t match_id = FILTER_MATCH_ID(slot);
+    pf.match_id = match_id;
+    if (bpf_map_update_elem(fmap_fd, &slot, &pf, BPF_ANY) < 0) {
+        fprintf(stderr, "Failed to install filter: %s\n", strerror(errno));
+        return -1;
+    }
+    printf("Installed pcap filter slot=%d match_id=0x%lx: '%s'\n", slot, match_id, expr);
+    return match_id;
 }
 
 /**
@@ -307,6 +382,78 @@ static int cmd_del_pef(struct ingress_entry *ingress, int num_ingress)
 
     printf("Deleted elimination flow (%d ingress keys)\n", num_ingress);
     close(idx_fd); close(elim_fd);
+    return 0;
+}
+
+/**
+ * @brief Add one or more PREF replication flows. Each ingress entry becomes its
+ * own flow (own match_id + sequence generator) sharing the given egress set.
+ * fl/rsid entries use the match_id from the packet; filter entries are compiled
+ * with libpcap, installed into pcap_filter_map, and assigned a match_id.
+ */
+static int cmd_add_prf_flows(struct ingress_entry *ingress, int num_ingress,
+                             char egress[][MAX_IFNAME_LEN], struct in6_addr *addrs,
+                             int num_egress, bool no_encap)
+{
+    int fmap_fd = -1;
+    int rc = 0;
+
+    for (int j = 0; j < num_ingress; j++) {
+        int64_t mid;
+        if (ingress[j].mtype == MATCH_FILTER) {
+            if (fmap_fd < 0) {
+                fmap_fd = open_pinned("pcap_filter_map");
+                if (fmap_fd < 0) { rc = 1; break; }
+            }
+            mid = install_filter(fmap_fd, ingress[j].filter_expr);
+            if (mid < 0) { rc = 1; break; }
+        } else {
+            mid = ingress[j].match_id;
+        }
+        rc = cmd_add_prf(mid, egress, addrs, num_egress, no_encap);
+        if (rc)
+            break;
+    }
+
+    if (fmap_fd >= 0)
+        close(fmap_fd);
+    return rc;
+}
+
+/**
+ * @brief Delete one or more PREF replication flows. Filter entries are matched
+ * back to their slot by recompiling the expression and comparing bytecode, then
+ * removed from pcap_filter_map.
+ */
+static int cmd_del_prf_flows(struct ingress_entry *ingress, int num_ingress)
+{
+    int fmap_fd = -1;
+
+    for (int j = 0; j < num_ingress; j++) {
+        if (ingress[j].mtype == MATCH_FILTER) {
+            if (fmap_fd < 0) {
+                fmap_fd = open_pinned("pcap_filter_map");
+                if (fmap_fd < 0)
+                    return 1;
+            }
+            int64_t mid;
+            int slot = find_filter_slot_by_expr(fmap_fd, ingress[j].filter_expr, &mid);
+            if (slot < 0) {
+                fprintf(stderr, "No installed filter matches: '%s'\n", ingress[j].filter_expr);
+                continue;
+            }
+            cmd_del_prf(mid);
+            struct pcap_filter zero;
+            memset(&zero, 0, sizeof(zero));
+            bpf_map_update_elem(fmap_fd, &slot, &zero, BPF_ANY);
+            printf("Removed pcap filter slot=%d\n", slot);
+        } else {
+            cmd_del_prf(ingress[j].match_id);
+        }
+    }
+
+    if (fmap_fd >= 0)
+        close(fmap_fd);
     return 0;
 }
 
@@ -505,6 +652,30 @@ static int print_dst_addr_map(void)
 }
 
 /**
+ * @brief Print pcap_filter_map entries. Each installed slot shows its bound
+ * flow match ID and compiled instruction count.
+ */
+static int print_pcap_filter_map(void)
+{
+    int fd = open_pinned_opt("pcap_filter_map", true);
+    if (fd < 0)
+        return 0;
+
+    bool has_entries = false;
+    for (int i = 0; i < MAX_PCAP_FILTERS; i++) {
+        struct pcap_filter f;
+        if (bpf_map_lookup_elem(fd, &i, &f) == 0 && f.len > 0) {
+            if (!has_entries) { printf("- pcap_filter_map:\n"); has_entries = true; }
+            printf("    slot=%d len=%u match_id=", i, f.len);
+            print_match_id(f.match_id);
+            printf("\n");
+        }
+    }
+    close(fd);
+    return 0;
+}
+
+/**
  * @brief List all active flows by printing all pinned BPF map contents.
  * @return 0 on success.
  */
@@ -512,6 +683,7 @@ static int cmd_list(void)
 {
     print_seqgen_map();
     print_replicate_tx_map();
+    print_pcap_filter_map();
     print_dst_addr_map();
     print_seqrcvy_idx_map();
     print_seqrcvy_map();
@@ -521,35 +693,64 @@ static int cmd_list(void)
 }
 
 /**
- * @brief Parse PREF ingress argument. Format: IFNAME:fl:NUM or IFNAME:rsid:FUNCT:FLOW_ID
+ * @brief Parse PREF ingress argument.
+ * Formats: IFNAME:fl:NUM | IFNAME:rsid:FUNCT:FLOW_ID | IFNAME:filter:EXPR
+ * For filter, EXPR is taken verbatim (it may itself contain ':' as in IPv6
+ * addresses), so parsing is done manually rather than with strtok.
  */
 static int parse_pref_ingress(char *arg, struct ingress_entry *entry)
 {
-    char *tok = strtok(arg, ":");
-    if (!tok) return -1;
-    strncpy(entry->ifname, tok, MAX_IFNAME_LEN - 1);
+    char *colon = strchr(arg, ':');
+    if (!colon)
+        return -1;
+    *colon = '\0';
+    strncpy(entry->ifname, arg, MAX_IFNAME_LEN - 1);
+    entry->ifname[MAX_IFNAME_LEN - 1] = '\0';
+    char *rest = colon + 1;
 
-    tok = strtok(NULL, ":");
-    if (!tok) return -1;
+    // filter: take the remainder of the string verbatim as the pcap expression.
+    if (strncmp(rest, "filter:", 7) == 0) {
+        const char *expr = rest + 7;
+        if (*expr == '\0')
+            return -1;
+        entry->mtype = MATCH_FILTER;
+        entry->match_id = -1; // allocated at install time
+        strncpy(entry->filter_expr, expr, MAX_FILTER_EXPR_LEN - 1);
+        entry->filter_expr[MAX_FILTER_EXPR_LEN - 1] = '\0';
+        return 0;
+    }
 
-    if (strcmp(tok, "fl") == 0) {
-        tok = strtok(NULL, ":");
-        if (!tok) return -1;
-        long val;
-        if (parse_number(tok, 10, 0xFFFFF, &val) < 0) return -1;
+    char *kind = rest;
+    char *val = strchr(rest, ':');
+    if (!val)
+        return -1;
+    *val = '\0';
+    val++;
+
+    if (strcmp(kind, "fl") == 0) {
+        long v;
+        if (parse_number(val, 10, 0xFFFFF, &v) < 0)
+            return -1;
         entry->mtype = MATCH_FL;
-        entry->match_id = (int64_t)val;
-    } else if (strcmp(tok, "rsid") == 0) {
-        tok = strtok(NULL, ":");
-        if (!tok) return -1;
-        long fval;
-        if (parse_number(tok, 16, 0xFFFF, &fval) < 0) return -1;
-
-        tok = strtok(NULL, ":");
-        if (!tok) return -1;
-        long fidval;
-        if (parse_number(tok, 16, 0xFFFFF, &fidval) < 0) return -1;
-
+        entry->match_id = (int64_t)v;
+    } else if (strcmp(kind, "rsid") == 0) {
+        char *fidstr = strchr(val, ':');
+        if (!fidstr)
+            return -1;
+        *fidstr = '\0';
+        fidstr++;
+        long fval, fidval;
+        if (parse_number(val, 16, 0xFFFF, &fval) < 0)
+            return -1;
+        // funct 0xFFFF is reserved as the pcap-filter marker (FILTER_FUNCT_MARKER):
+        // filter flows use match_id (0xFFFF<<20 | slot), so an rsid flow with this
+        // funct would collide in seqgen_map/dst_addr_map. Reject it.
+        if (fval == FILTER_FUNCT_MARKER) {
+            fprintf(stderr, "rsid funct 0x%x is reserved for pcap filters\n", FILTER_FUNCT_MARKER);
+            return -1;
+        }
+        if (parse_number(fidstr, 16, 0xFFFFF, &fidval) < 0)
+            return -1;
         entry->mtype = MATCH_RSID;
         entry->match_id = ((int64_t)fval << 20) | (fidval & 0xFFFFF);
     } else {
@@ -644,7 +845,7 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "FRER ctl not yet updated for new map format\n");
                 return EXIT_FAILURE;
             case PREF_REPL:
-                return cmd_add_prf(ingress[0].match_id, egress_ifnames, egress_addrs, num_egress, no_encap);
+                return cmd_add_prf_flows(ingress, num_ingress, egress_ifnames, egress_addrs, num_egress, no_encap);
             case PREF_ELIM:
                 return cmd_add_pef(ingress, num_ingress, egress_ifnames[0], &egress_addrs[0], no_encap);
         }
@@ -655,7 +856,7 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "FRER ctl not yet updated for new map format\n");
                 return EXIT_FAILURE;
             case PREF_REPL:
-                return cmd_del_prf(ingress[0].match_id);
+                return cmd_del_prf_flows(ingress, num_ingress);
             case PREF_ELIM:
                 return cmd_del_pef(ingress, num_ingress);
         }
