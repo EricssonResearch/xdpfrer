@@ -326,6 +326,10 @@ static inline int add_outer_ipv6(struct xdp_md *pkt, int flow_label, int64_t mat
  * A nonzero return value (the snap length) means "match".
  * ------------------------------------------------------------------------- */
 
+#include <linux/bpf_common.h>
+
+#define CBPF_SNAP 64
+
 // Filter slot -> compiled pcap (cBPF) filter, iterated at ingress in replicate().
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -334,92 +338,16 @@ struct {
     __type(value, struct pcap_filter);
 } pcap_filter_map SEC(".maps");
 
-// Classic BPF opcode decoding (see linux/filter.h / pcap-bpf.h). Prefixed to
-// avoid clashing with any eBPF BPF_* macros from vmlinux.h.
-#define CBPF_CLASS(c) ((c) & 0x07)
-#define CBPF_LD   0x00
-#define CBPF_LDX  0x01
-#define CBPF_ST   0x02
-#define CBPF_STX  0x03
-#define CBPF_ALU  0x04
-#define CBPF_JMP  0x05
-#define CBPF_RET  0x06
-#define CBPF_MISC 0x07
-
-#define CBPF_SIZE(c) ((c) & 0x18)
-#define CBPF_W 0x00
-#define CBPF_H 0x08
-#define CBPF_B 0x10
-
-#define CBPF_MODE(c) ((c) & 0xe0)
-#define CBPF_IMM 0x00
-#define CBPF_ABS 0x20
-#define CBPF_IND 0x40
-#define CBPF_MEM 0x60
-#define CBPF_LEN 0x80
-#define CBPF_MSH 0xa0
-
-#define CBPF_OP(c) ((c) & 0xf0)
-#define CBPF_ADD 0x00
-#define CBPF_SUB 0x10
-#define CBPF_MUL 0x20
-#define CBPF_DIV 0x30
-#define CBPF_OR  0x40
-#define CBPF_AND 0x50
-#define CBPF_LSH 0x60
-#define CBPF_RSH 0x70
-#define CBPF_NEG 0x80
-#define CBPF_MOD 0x90
-#define CBPF_XOR 0xa0
-#define CBPF_JA   0x00
-#define CBPF_JEQ  0x10
-#define CBPF_JGT  0x20
-#define CBPF_JGE  0x30
-#define CBPF_JSET 0x40
-
-#define CBPF_SRC(c) ((c) & 0x08)
-#define CBPF_K 0x00
-#define CBPF_X 0x08
-
-#define CBPF_RVAL(c) ((c) & 0x18)
-#define CBPF_A 0x10
-
-#define CBPF_MISCOP(c) ((c) & 0xf8)
-#define CBPF_TAX 0x00
-#define CBPF_TXA 0x80
-
-#define CBPF_MEM_SLOTS 16
-
-/*
- * Packet header snapshot size for filter evaluation. Copied once into a stack
- * buffer per filter run; the interpreter reads packet bytes from this buffer
- * instead of doing per-instruction packet access. 64 bytes covers Ethernet +
- * IPv6 + L4 ports, which is enough for src/dst host and port matching. Accesses
- * beyond this are treated as out-of-bounds (filter fails on them).
- */
-#define CBPF_SNAP 64
-
-/*
- * Interpreter state, also the bpf_loop() callback context. Contains only scalars
- * and inline arrays (no packet/map pointers), so it is safe to pass across the
- * bpf_loop callback boundary. The cBPF program is re-looked-up by slot inside the
- * callback rather than carried as a pointer.
- */
 struct cbpf_state {
-    uint32_t A, X, pc, len;
-    uint32_t plen;                        // real packet length (for the LEN opcode)
-    uint32_t caplen;                      // bytes actually captured in buf (<= CBPF_SNAP)
-    int slot;                             // pcap_filter_map slot being evaluated
-    int result;                           // verdict once a RET is reached
-    int done;                             // set when a RET is reached
-    uint32_t mem[CBPF_MEM_SLOTS];         // cBPF scratch memory M[]
-    unsigned char buf[CBPF_SNAP + 4];     // packet snapshot (+4 padding for word reads)
+    uint32_t A, X, pc;
+    uint32_t plen, caplen;
+    int match;
+    uint32_t mem[16];
+    uint8_t buf[CBPF_SNAP + 4];
 };
 
-// Per-CPU scratch for cbpf_state. Kept off the BPF stack (the struct is ~150 bytes,
-// which would blow the 512-byte combined stack limit of the replicate -> cbpf_step
-// call chain). XDP runs non-preemptibly per-CPU and run_cbpf finishes with the
-// scratch before returning, so a single-entry per-CPU array is safe to reuse.
+// Per-CPU scratch for cbpf_state to keep the packet snapshot and scratch memory
+// off the BPF stack.
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
@@ -427,11 +355,9 @@ struct {
     __type(value, struct cbpf_state);
 } cbpf_scratch SEC(".maps");
 
-// bpf_loop() requires its callback context to be a stack pointer, so we pass a
-// tiny stack wrapper that just holds a pointer to the per-CPU cbpf_state. This
-// keeps the large state in the map (off the stack) while satisfying the verifier.
-struct cbpf_loop_ctx {
+struct cbpf_ctx {
     struct cbpf_state *s;
+    struct pcap_filter *f;
 };
 
 /**
@@ -440,170 +366,91 @@ struct cbpf_loop_ctx {
  */
 static __always_inline int cbpf_load(struct cbpf_state *s, uint32_t off, uint16_t size, uint32_t *out)
 {
-    uint32_t n = (size == CBPF_W) ? 4 : (size == CBPF_H) ? 2 : 1;
-
-    if (off >= CBPF_SNAP || off + n > s->caplen) // outside the real (captured) packet
+    uint32_t n = (size == BPF_W) ? 4 : (size == BPF_H) ? 2 : 1;
+    if (off >= CBPF_SNAP || off + n > s->caplen)
         return -1;
-    uint32_t o = off & (CBPF_SNAP - 1);   // bound the index for the verifier
-
-    if (n == 4)
-        *out = ((uint32_t)s->buf[o] << 24) | ((uint32_t)s->buf[o + 1] << 16) |
-               ((uint32_t)s->buf[o + 2] << 8) | (uint32_t)s->buf[o + 3];
-    else if (n == 2)
-        *out = ((uint32_t)s->buf[o] << 8) | (uint32_t)s->buf[o + 1];
-    else
-        *out = (uint32_t)s->buf[o];
+    uint8_t *p = &s->buf[off & (CBPF_SNAP - 1)];
+    *out = (n == 4) ? bpf_ntohl(*(__u32 *)p) : (n == 2) ? bpf_ntohs(*(__u16 *)p) : *p;
     return 0;
 }
 
 /**
  * @brief bpf_loop() callback: execute a single cBPF instruction at s->pc.
- * @return 1 to stop the loop (RET reached, pc past the end, or lookup failure),
+ * @return 1 to stop the loop (RET reached, pc past the end, or error),
  *         0 to continue with the next iteration.
  */
 static long cbpf_step(__u32 index, void *vctx)
 {
-    struct cbpf_loop_ctx *lc = vctx;
-    struct cbpf_state *s = lc->s;
+    struct cbpf_ctx *c = vctx;
+    struct cbpf_state *s = c->s;
+    struct pcap_filter *f = c->f;
     (void)index;
 
-    if (!s || s->pc >= s->len)
+    if (!s || !f || s->pc >= f->len)
         return 1;
 
-    int slot = s->slot;
-    struct pcap_filter *f = bpf_map_lookup_elem(&pcap_filter_map, &slot);
-    if (!f)
-        return 1;
-
-    struct cbpf_insn insn = f->insns[s->pc & (MAX_CBPF_INSNS - 1)];
+    struct cbpf_insn insn = f->insns[s->pc++ & (MAX_CBPF_INSNS - 1)];
     uint16_t code = insn.code;
-    uint32_t k = insn.k;
-    uint32_t v;
+    uint32_t k = insn.k, op = (BPF_SRC(code) == BPF_X) ? s->X : k, v;
 
-    switch (CBPF_CLASS(code)) {
-    case CBPF_LD:
-        switch (CBPF_MODE(code)) {
-        case CBPF_IMM: s->A = k; break;
-        case CBPF_ABS:
-            if (cbpf_load(s, k, CBPF_SIZE(code), &s->A) < 0) { s->done = 1; s->result = 0; return 1; }
-            break;
-        case CBPF_IND:
-            if (cbpf_load(s, k + s->X, CBPF_SIZE(code), &s->A) < 0) { s->done = 1; s->result = 0; return 1; }
-            break;
-        case CBPF_MEM: s->A = s->mem[k & (CBPF_MEM_SLOTS - 1)]; break;
-        case CBPF_LEN: s->A = s->plen; break;
-        default: s->done = 1; s->result = 0; return 1;
+    switch (BPF_CLASS(code)) {
+    case BPF_LD:
+        switch (BPF_MODE(code)) {
+        case BPF_IMM: s->A = k; return 0;
+        case BPF_ABS: return cbpf_load(s, k, BPF_SIZE(code), &s->A) < 0;
+        case BPF_IND: return cbpf_load(s, k + s->X, BPF_SIZE(code), &s->A) < 0;
+        case BPF_MEM: s->A = s->mem[k & 15]; return 0;
+        case BPF_LEN: s->A = s->plen; return 0;
+        default: return 1;
         }
-        break;
-    case CBPF_LDX:
-        switch (CBPF_MODE(code)) {
-        case CBPF_IMM: s->X = k; break;
-        case CBPF_MEM: s->X = s->mem[k & (CBPF_MEM_SLOTS - 1)]; break;
-        case CBPF_LEN: s->X = s->plen; break;
-        case CBPF_MSH: // X = 4 * (P[k] & 0xf) - IPv4 header length
-            if (cbpf_load(s, k, CBPF_B, &v) < 0) { s->done = 1; s->result = 0; return 1; }
-            s->X = 4 * (v & 0xf);
-            break;
-        default: s->done = 1; s->result = 0; return 1;
-        }
-        break;
-    case CBPF_ST:  s->mem[k & (CBPF_MEM_SLOTS - 1)] = s->A; break;
-    case CBPF_STX: s->mem[k & (CBPF_MEM_SLOTS - 1)] = s->X; break;
-    case CBPF_ALU: {
-        uint32_t op = (CBPF_SRC(code) == CBPF_X) ? s->X : k;
-        switch (CBPF_OP(code)) {
-        case CBPF_ADD: s->A += op; break;
-        case CBPF_SUB: s->A -= op; break;
-        case CBPF_MUL: s->A *= op; break;
-        case CBPF_DIV: if (op == 0) { s->done = 1; s->result = 0; return 1; } s->A /= op; break;
-        case CBPF_MOD: if (op == 0) { s->done = 1; s->result = 0; return 1; } s->A %= op; break;
-        case CBPF_AND: s->A &= op; break;
-        case CBPF_OR:  s->A |= op; break;
-        case CBPF_XOR: s->A ^= op; break;
-        case CBPF_LSH: s->A <<= (op & 31); break;
-        case CBPF_RSH: s->A >>= (op & 31); break;
-        case CBPF_NEG: s->A = -s->A; break;
-        default: s->done = 1; s->result = 0; return 1;
-        }
-        break;
-    }
-    case CBPF_JMP: {
-        if (CBPF_OP(code) == CBPF_JA) {
-            s->pc += 1 + k;
+    case BPF_LDX:
+        switch (BPF_MODE(code)) {
+        case BPF_IMM: s->X = k; return 0;
+        case BPF_MEM: s->X = s->mem[k & 15]; return 0;
+        case BPF_LEN: s->X = s->plen; return 0;
+        case BPF_MSH:
+            if (cbpf_load(s, k, BPF_B, &v) < 0) return 1;
+            s->X = (v & 0xf) * 4;
             return 0;
+        default: return 1;
         }
-        uint32_t op = (CBPF_SRC(code) == CBPF_X) ? s->X : k;
-        int taken;
-        switch (CBPF_OP(code)) {
-        case CBPF_JEQ:  taken = (s->A == op); break;
-        case CBPF_JGT:  taken = (s->A > op);  break;
-        case CBPF_JGE:  taken = (s->A >= op); break;
-        case CBPF_JSET: taken = (s->A & op);  break;
-        default: s->done = 1; s->result = 0; return 1;
+    case BPF_ST:  s->mem[k & 15] = s->A; return 0;
+    case BPF_STX: s->mem[k & 15] = s->X; return 0;
+    case BPF_ALU:
+        switch (BPF_OP(code)) {
+        case BPF_ADD: s->A += op; return 0;
+        case BPF_SUB: s->A -= op; return 0;
+        case BPF_MUL: s->A *= op; return 0;
+        case BPF_DIV: if (!op) return 1; s->A /= op; return 0;
+        case BPF_MOD: if (!op) return 1; s->A %= op; return 0;
+        case BPF_AND: s->A &= op; return 0;
+        case BPF_OR:  s->A |= op; return 0;
+        case BPF_XOR: s->A ^= op; return 0;
+        case BPF_LSH: s->A <<= (op & 31); return 0;
+        case BPF_RSH: s->A >>= (op & 31); return 0;
+        case BPF_NEG: s->A = -s->A; return 0;
+        default: return 1;
         }
-        s->pc += 1 + (taken ? insn.jt : insn.jf);
+    case BPF_JMP:
+        if (BPF_OP(code) == BPF_JA) { s->pc += k; return 0; }
+        switch (BPF_OP(code)) {
+        case BPF_JEQ:  v = (s->A == op); break;
+        case BPF_JGT:  v = (s->A > op);  break;
+        case BPF_JGE:  v = (s->A >= op); break;
+        case BPF_JSET: v = (s->A & op);  break;
+        default: return 1;
+        }
+        s->pc += v ? insn.jt : insn.jf;
         return 0;
-    }
-    case CBPF_RET: {
-        uint32_t rv = (CBPF_RVAL(code) == CBPF_A) ? s->A : k;
-        s->result = (rv != 0);
-        s->done = 1;
+    case BPF_RET:
+        s->match = (((code & 0x18) == 0x10) ? s->A : k) != 0;
+        return 1;
+    case BPF_MISC:
+        if (code & 0xf8) s->A = s->X; else s->X = s->A;
+        return 0;
+    default:
         return 1;
     }
-    case CBPF_MISC:
-        if (CBPF_MISCOP(code) == CBPF_TAX) s->X = s->A; // TAX
-        else                               s->A = s->X; // TXA
-        break;
-    default:
-        s->done = 1; s->result = 0; return 1;
-    }
-
-    s->pc += 1;
-    return 0;
-}
-
-/**
- * @brief Execute the compiled cBPF filter in slot `slot` against the packet.
- * Uses bpf_loop() so the interpreter body is verified once regardless of the
- * instruction count, keeping verifier complexity bounded.
- * @return 1 if the filter matches, 0 otherwise.
- */
-static __always_inline int run_cbpf(struct xdp_md *ctx, int slot, uint32_t len)
-{
-    int zero = 0;
-    struct cbpf_state *s = bpf_map_lookup_elem(&cbpf_scratch, &zero);
-    if (!s)
-        return 0;
-
-    uint32_t plen = (uint32_t)((long)ctx->data_end - (long)ctx->data);
-    uint32_t caplen;
-
-    // Bound caplen with a mask so the verifier sees a clean 0..CBPF_SNAP value
-    // (a pointer-difference scalar has unknown upper bits; a plain min() leaves
-    // the length's 64-bit range unbounded and bpf_xdp_load_bytes is rejected).
-    if (plen >= CBPF_SNAP)
-        caplen = CBPF_SNAP;
-    else
-        caplen = plen & (CBPF_SNAP - 1);
-
-    // Reset per-run state (the per-CPU scratch persists across invocations).
-    s->A = 0;
-    s->X = 0;
-    s->pc = 0;
-    s->result = 0;
-    s->done = 0;
-    __builtin_memset(s->mem, 0, sizeof(s->mem));
-    s->slot = slot;
-    s->plen = plen;
-    s->caplen = caplen;
-    s->len = len > MAX_CBPF_INSNS ? MAX_CBPF_INSNS : len;
-
-    if (caplen > 0 && bpf_xdp_load_bytes(ctx, 0, s->buf, caplen) < 0)
-        return 0;
-
-    struct cbpf_loop_ctx lc = { .s = s };
-    bpf_loop(MAX_CBPF_INSNS, cbpf_step, &lc, 0);
-    return s->done ? s->result : 0;
 }
 
 /**
@@ -612,16 +459,36 @@ static __always_inline int run_cbpf(struct xdp_md *ctx, int slot, uint32_t len)
  */
 static __always_inline int64_t run_pcap_filters(struct xdp_md *pkt)
 {
+    int zero = 0;
+    struct cbpf_state *s = bpf_map_lookup_elem(&cbpf_scratch, &zero);
+    if (!s)
+        return -1;
+
+    uint32_t plen = (uint32_t)((long)pkt->data_end - (long)pkt->data);
+    uint32_t caplen = (plen >= CBPF_SNAP) ? CBPF_SNAP : (plen & (CBPF_SNAP - 1));
+    bool loaded = false;
+
     #pragma clang loop unroll(disable)
     for (int i = 0; i < MAX_PCAP_FILTERS; i++) {
         int key = i;
         struct pcap_filter *f = bpf_map_lookup_elem(&pcap_filter_map, &key);
         if (!f || f->len == 0)
             continue;
-        uint32_t len = f->len;
-        int64_t mid = f->match_id;
-        if (run_cbpf(pkt, i, len))
-            return mid;
+        if (!loaded) {
+            if (caplen == 0 || bpf_xdp_load_bytes(pkt, 0, s->buf, caplen) < 0)
+                return -1;
+            s->plen = plen;
+            s->caplen = caplen;
+            loaded = true;
+        }
+
+        s->A = s->X = s->pc = s->match = 0;
+        __builtin_memset(s->mem, 0, sizeof(s->mem));
+
+        struct cbpf_ctx ctx = { .s = s, .f = f };
+        bpf_loop(MAX_CBPF_INSNS, cbpf_step, &ctx, 0);
+        if (s->match)
+            return f->match_id;
     }
     return -1;
 }
