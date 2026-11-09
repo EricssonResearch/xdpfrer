@@ -188,15 +188,24 @@ static int find_filter_slot_by_expr(int fmap_fd, const char *expr, int64_t *matc
 }
 
 /**
- * @brief Compile `expr`, place it in a free pcap_filter_map slot, and return the
- * allocated flow match_id (FILTER_MATCH_ID(slot)).
- * @return match_id on success, -1 on failure.
+ * @brief Compile `expr`, verify it is not already installed, and allocate a free
+ * pcap_filter_map slot without activating it yet.
+ * @return slot index on success, -1 on failure.
  */
-static int64_t install_filter(int fmap_fd, const char *expr)
+static int prepare_filter(int fmap_fd, const char *expr, struct pcap_filter *pf)
 {
-    struct pcap_filter pf;
-    if (compile_pcap_filter(expr, &pf) < 0)
+    if (compile_pcap_filter(expr, pf) < 0)
         return -1;
+
+    for (int i = 0; i < MAX_PCAP_FILTERS; i++) {
+        struct pcap_filter f;
+        if (bpf_map_lookup_elem(fmap_fd, &i, &f) == 0 &&
+            f.len != 0 && f.len == pf->len &&
+            memcmp(f.insns, pf->insns, f.len * sizeof(struct cbpf_insn)) == 0) {
+            fprintf(stderr, "Filter already installed in slot %d: '%s'\n", i, expr);
+            return -1;
+        }
+    }
 
     int slot = alloc_filter_slot(fmap_fd);
     if (slot < 0) {
@@ -204,14 +213,8 @@ static int64_t install_filter(int fmap_fd, const char *expr)
         return -1;
     }
 
-    int64_t match_id = FILTER_MATCH_ID(slot);
-    pf.match_id = match_id;
-    if (bpf_map_update_elem(fmap_fd, &slot, &pf, BPF_ANY) < 0) {
-        fprintf(stderr, "Failed to install filter: %s\n", strerror(errno));
-        return -1;
-    }
-    printf("Installed pcap filter slot=%d match_id=0x%lx: '%s'\n", slot, match_id, expr);
-    return match_id;
+    pf->match_id = FILTER_MATCH_ID(slot);
+    return slot;
 }
 
 /**
@@ -400,19 +403,35 @@ static int cmd_add_prf_flows(struct ingress_entry *ingress, int num_ingress,
 
     for (int j = 0; j < num_ingress; j++) {
         int64_t mid;
+        int slot = -1;
+        struct pcap_filter pf = {};
+
         if (ingress[j].mtype == MATCH_FILTER) {
             if (fmap_fd < 0) {
                 fmap_fd = open_pinned("pcap_filter_map");
                 if (fmap_fd < 0) { rc = 1; break; }
             }
-            mid = install_filter(fmap_fd, ingress[j].filter_expr);
-            if (mid < 0) { rc = 1; break; }
+            slot = prepare_filter(fmap_fd, ingress[j].filter_expr, &pf);
+            if (slot < 0) { rc = 1; break; }
+            mid = pf.match_id;
         } else {
             mid = ingress[j].match_id;
         }
+
         rc = cmd_add_prf(mid, egress, addrs, num_egress, no_encap);
         if (rc)
             break;
+
+        if (slot >= 0) {
+            if (bpf_map_update_elem(fmap_fd, &slot, &pf, BPF_ANY) < 0) {
+                fprintf(stderr, "Failed to install filter: %s\n", strerror(errno));
+                cmd_del_prf(mid);
+                rc = 1;
+                break;
+            }
+            printf("Installed pcap filter slot=%d match_id=0x%lx: '%s'\n",
+                   slot, mid, ingress[j].filter_expr);
+        }
     }
 
     if (fmap_fd >= 0)
@@ -428,6 +447,7 @@ static int cmd_add_prf_flows(struct ingress_entry *ingress, int num_ingress,
 static int cmd_del_prf_flows(struct ingress_entry *ingress, int num_ingress)
 {
     int fmap_fd = -1;
+    int rc = 0;
 
     for (int j = 0; j < num_ingress; j++) {
         if (ingress[j].mtype == MATCH_FILTER) {
@@ -440,21 +460,23 @@ static int cmd_del_prf_flows(struct ingress_entry *ingress, int num_ingress)
             int slot = find_filter_slot_by_expr(fmap_fd, ingress[j].filter_expr, &mid);
             if (slot < 0) {
                 fprintf(stderr, "No installed filter matches: '%s'\n", ingress[j].filter_expr);
+                rc = 1;
                 continue;
             }
-            cmd_del_prf(mid);
-            struct pcap_filter zero;
-            memset(&zero, 0, sizeof(zero));
+            struct pcap_filter zero = {};
             bpf_map_update_elem(fmap_fd, &slot, &zero, BPF_ANY);
             printf("Removed pcap filter slot=%d\n", slot);
+            if (cmd_del_prf(mid) != 0)
+                rc = 1;
         } else {
-            cmd_del_prf(ingress[j].match_id);
+            if (cmd_del_prf(ingress[j].match_id) != 0)
+                rc = 1;
         }
     }
 
     if (fmap_fd >= 0)
         close(fmap_fd);
-    return 0;
+    return rc;
 }
 
 /**
@@ -803,6 +825,10 @@ int main(int argc, char *argv[])
             if (mode == PREF_REPL || mode == PREF_ELIM) {
                 if (parse_pref_ingress(argv[i], &ingress[num_ingress]) < 0) {
                     fprintf(stderr, "Invalid ingress format. Use IFNAME:fl:NUM or IFNAME:rsid:FUNCT:FLOW_ID\n");
+                    return EXIT_FAILURE;
+                }
+                if (mode != PREF_REPL && ingress[num_ingress].mtype == MATCH_FILTER) {
+                    fprintf(stderr, "pcap filter ingress is only supported in prf (replication) mode\n");
                     return EXIT_FAILURE;
                 }
             } else {

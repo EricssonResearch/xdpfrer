@@ -210,23 +210,18 @@ static int64_t get_map_key(struct config_item *cfg)
 }
 
 /**
- * @brief Compile the config's pcap expression and install it into a free slot of
- * pcap_filter_map, recording the slot in cfg->pmatch.slot. Idempotent: does nothing
- * if a slot is already assigned.
+ * @brief Compile the config's pcap expression and find a free slot in
+ * pcap_filter_map, recording the slot in cfg->pmatch.slot.
  * @return 0 on success, -1 on failure.
  */
-static int install_daemon_filter(int fmap_fd, struct config_item *cfg)
+static int prepare_daemon_filter(int fmap_fd, struct config_item *cfg, struct pcap_filter *pf)
 {
-    if (cfg->pmatch.slot >= 0)
-        return 0; // already installed
-
     if (fmap_fd < 0) {
         fprintf(stderr, "pcap_filter_map not available\n");
         return -1;
     }
 
-    struct pcap_filter pf;
-    if (compile_pcap_filter(cfg->pmatch.filter_expr, &pf) < 0)
+    if (compile_pcap_filter(cfg->pmatch.filter_expr, pf) < 0)
         return -1;
 
     int slot = -1;
@@ -242,15 +237,8 @@ static int install_daemon_filter(int fmap_fd, struct config_item *cfg)
         return -1;
     }
 
-    pf.match_id = FILTER_MATCH_ID(slot);
-    if (bpf_map_update_elem(fmap_fd, &slot, &pf, BPF_ANY) < 0) {
-        fprintf(stderr, "Failed to install pcap filter: %s\n", strerror(errno));
-        return -1;
-    }
-
+    pf->match_id = FILTER_MATCH_ID(slot);
     cfg->pmatch.slot = slot;
-    printf("Installed pcap filter slot=%d match_id=0x%lx: '%s'\n",
-           slot, (long)FILTER_MATCH_ID(slot), cfg->pmatch.filter_expr);
     return 0;
 }
 
@@ -265,11 +253,14 @@ static int install_daemon_filter(int fmap_fd, struct config_item *cfg)
 static int configure_replication(struct skel_fds *fds, struct config_item *cfg)
 {
     int ret = EXIT_SUCCESS;
+    struct pcap_filter pf = {};
+    bool install_filter = (cfg->mode == PREF_REPL && cfg->pmatch.mtype == MATCH_FILTER &&
+                           cfg->pmatch.slot < 0);
 
-    // For filter flows, compile and install the pcap filter first so get_map_key()
-    // can derive the (slot-based) match ID.
-    if (cfg->mode == PREF_REPL && cfg->pmatch.mtype == MATCH_FILTER) {
-        if (install_daemon_filter(fds->pcap_filter_map, cfg) < 0)
+    // For filter flows, compile the pcap filter and allocate a slot first so
+    // get_map_key() can derive the (slot-based) match ID.
+    if (install_filter) {
+        if (prepare_daemon_filter(fds->pcap_filter_map, cfg, &pf) < 0)
             return -EINVAL;
     }
 
@@ -320,9 +311,6 @@ static int configure_replication(struct skel_fds *fds, struct config_item *cfg)
     }
 
     close(tx_ifaces_map_fd);
-    ret = config_xdp_prog(fds, cfg);
-    if (ret < 0)
-        return ret;
 
     struct seq_gen new_gen = {};
     new_gen.no_encap = no_encap;
@@ -331,6 +319,19 @@ static int configure_replication(struct skel_fds *fds, struct config_item *cfg)
         fprintf(stderr, "Failed to insert sequence generator into seqgen map. Maybe already exists?\n");
         return -EINVAL;
     }
+
+    if (install_filter) {
+        if (bpf_map_update_elem(fds->pcap_filter_map, &cfg->pmatch.slot, &pf, BPF_ANY) < 0) {
+            fprintf(stderr, "Failed to install pcap filter: %s\n", strerror(errno));
+            return -EINVAL;
+        }
+        printf("Installed pcap filter slot=%d match_id=0x%lx: '%s'\n",
+               cfg->pmatch.slot, (long)key, cfg->pmatch.filter_expr);
+    }
+
+    ret = config_xdp_prog(fds, cfg);
+    if (ret < 0)
+        return ret;
 
     return EXIT_SUCCESS;
 }
@@ -801,6 +802,10 @@ static int parse_opt(int key, char *arg, struct argp_state *state) {
                     long fval;
                     if (parse_number(token, 16, 0xFFFF, &fval) < 0) {
                         fprintf(stderr, "Invalid function '%s'. Must be hex (0-FFFF).\n", token);
+                        exit(EXIT_FAILURE);
+                    }
+                    if (fval == FILTER_FUNCT_MARKER) {
+                        fprintf(stderr, "rsid funct 0x%x is reserved for pcap filters\n", FILTER_FUNCT_MARKER);
                         exit(EXIT_FAILURE);
                     }
 

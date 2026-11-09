@@ -442,7 +442,7 @@ static __always_inline int cbpf_load(struct cbpf_state *s, uint32_t off, uint16_
 {
     uint32_t n = (size == CBPF_W) ? 4 : (size == CBPF_H) ? 2 : 1;
 
-    if (off + n > s->caplen)              // outside the real (captured) packet
+    if (off >= CBPF_SNAP || off + n > s->caplen) // outside the real (captured) packet
         return -1;
     uint32_t o = off & (CBPF_SNAP - 1);   // bound the index for the verifier
 
@@ -659,7 +659,8 @@ int replicate(struct xdp_md *pkt)
 
     // Try rsid match (combined funct+flow_id from PREF SID), then fl match (IPv6
     // flow label), then any installed pcap filter (ingress-only, additional match).
-    if (read_pref_sid(pkt, &flow_id, &seq_dummy, &funct) == 0) {
+    if (read_pref_sid(pkt, &flow_id, &seq_dummy, &funct) == 0 &&
+        funct != FILTER_FUNCT_MARKER) {
         match_id = ((int64_t)funct << 20) | (flow_id & 0xFFFFF);
         gen = bpf_map_lookup_elem(&seqgen_map, &match_id);
     }
@@ -691,6 +692,14 @@ int replicate(struct xdp_md *pkt)
             bpf_printk("[Repl] Unable to remove SRH");
             goto drop;
         }
+        data = (void *)(long) pkt->data;
+        data_end = (void *)(long) pkt->data_end;
+        if (data + ethhdr_sz + ipv6hdr_sz > data_end)
+            goto drop;
+        struct ipv6hdr *outer = data + ethhdr_sz;
+        struct pref_sid *psid = (struct pref_sid *)&outer->daddr;
+        psid->funct = bpf_htons((uint16_t)((match_id >> 20) & 0xFFFF));
+        set_pref_flow_id(psid, (uint32_t)(match_id & 0xFFFFF));
     } else {
         uint16_t seq = gen_seq(gen);
         bpf_printk("[Repl] generated seq %d", seq);
