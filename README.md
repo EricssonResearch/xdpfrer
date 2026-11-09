@@ -606,7 +606,7 @@ Link addresses encode both endpoints: `5f00:0:0:23::2` is the `n2` side of the `
    back to its slot):
 
    ```
-   n2 xdppref-ctl del -m prf -i 'eth21:filter:ip6 and src host 5f00:0:0:12::1'
+   n2 xdppref-ctl del -m prf -i 'eth21:filter:ip6 and src host 5f00:0:0:1::111'
    n8 xdppref-ctl del -m pef -i eth84:rsid:f:10310 -i eth87:rsid:f:20320
    ```
 
